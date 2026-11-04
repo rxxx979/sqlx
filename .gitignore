@@ -23,3 +23,9 @@ _testmain.go
 *.exe
 tags
 environ
+
+# Test / profile artifacts
+*.test
+*.out
+*.prof
+coverage.txt
