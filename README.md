@@ -1,6 +1,9 @@
 # sqlx
 
-[![CircleCI](https://dl.circleci.com/status-badge/img/gh/jmoiron/sqlx/tree/master.svg?style=shield)](https://dl.circleci.com/status-badge/redirect/gh/jmoiron/sqlx/tree/master) [![Coverage Status](https://coveralls.io/repos/github/jmoiron/sqlx/badge.svg?branch=master)](https://coveralls.io/github/jmoiron/sqlx?branch=master) [![Godoc](http://img.shields.io/badge/godoc-reference-blue.svg?style=flat)](https://godoc.org/github.com/jmoiron/sqlx) [![license](http://img.shields.io/badge/license-MIT-red.svg?style=flat)](https://raw.githubusercontent.com/jmoiron/sqlx/master/LICENSE)
+[![license](http://img.shields.io/badge/license-MIT-red.svg?style=flat)](https://raw.githubusercontent.com/jmoiron/sqlx/master/LICENSE)
+
+Personal fork of [jmoiron/sqlx](https://github.com/jmoiron/sqlx), targeting Go 1.27.3+.
+Not intended for upstream PRs or as a `sqlc` replacement.
 
 sqlx is a library which provides a set of extensions on go's standard
 `database/sql` library.  The sqlx versions of `sql.DB`, `sql.TX`, `sql.Stmt`,
@@ -14,11 +17,65 @@ Major additional concepts are:
 * Named parameter support including prepared statements
 * `Get` and `Select` to go quickly from query to struct/slice
 
-In addition to the [godoc API documentation](http://godoc.org/github.com/jmoiron/sqlx),
+In addition to the [godoc API documentation](http://godoc.org/github.com/rxxx979/sqlx),
 there is also some [user documentation](http://jmoiron.github.io/sqlx/) that
 explains how to use `database/sql` along with sqlx.
 
+> **This fork** targets **Go 1.27.3+**, rewrites sqlx's reflection hot paths,
+> and adds generic/iterator fast paths, query hooks and `WithTx`.
+
 ## Recent Changes
+
+1.2.0 (unreleased):
+
+* New `WithTx(ctx, db, opts, fn)` helper: commits on success, rolls back on
+  error, rolls back and re-panics on panic. Rollback errors are joined with the
+  original error instead of being discarded.
+* Transaction begin/commit/rollback are reported through `QueryHook`.
+
+1.1.0 (query hooks):
+
+* New `sqlx.QueryHook` with `BeforeQuery` / `AfterQuery`, plus `HookFuncs` and
+  `MultiHook` adapters.
+* `DB.SetQueryHook` observes `Queryx`, `QueryRowx`, `Exec`, `Preparex` and
+  their Context variants; `Tx`, `Conn` and `Stmt` inherit the same hook.
+* Hook events include SQL, args, duration, `RowsScanned`, `RowsAffected`,
+  `Err` and hook-private `Data`.
+* `Queryx` events finish on `Rows.Close`; `QueryRowx` events finish on
+  `Row.Scan`; transaction events cover `Beginx`/`BeginTxx` and
+  `Commit`/`Rollback`.
+* Disabled hooks cost an atomic load; enabled hooks add roughly 2 allocations
+  per query.
+
+1.0.0 (first tagged fork release):
+
+* Requires Go 1.27.3; module and dependencies updated
+* Test/benchmark drivers: pure-Go `modernc.org/sqlite` and `pgx/v5`
+  (`mattn/go-sqlite3` and `lib/pq` removed)
+* **Faster scanning**: cached column plans, byte-offset field access, scratch-
+  value scanning, and a lock-free mapper cache. `Select` allocates within 3
+  allocations / 1000 rows of hand-written `database/sql`; non-generic
+  `StructScan` is ~6x faster and generic scanning with a reused destination is
+  ~20x faster than the original implementation (2002 → 1–2 allocations).
+* **Faster named queries**: compiled-query cache and cached bind plans make
+  `bindStruct` ~4.7x faster (11 → 1 allocs) and `bindArray` ~1.9x faster.
+* New: `GetAs[T]`, `SelectAs[T]`, `GetAsContext[T]`, `SelectAsContext[T]`,
+  `SelectAsInto[T]`, `SelectAsIntoContext[T]`, `SelectIter[T]`,
+  `SelectIterContext[T]`, `(*Rows).ScanAs[T]`, `(*Row).ScanAs[T]`.
+* Generic fast paths: scalar scans skip reflection entirely; struct `SelectAs`
+  resolves field addresses once per query and appends directly. With a reused
+  destination, pure scanning is ~20x faster than the original implementation.
+* `[]*T` scans now allocate one block per 64 rows instead of one object per row
+  (pure scan: 2001 → 33 allocations for 1000 rows).
+* New opt-in zero-reflection interfaces: `RowScanner` (scan a row without
+  planning) and `StructBinder` (bind named args without reflection).
+* Allocation note: with SQLite, `Select` is within 3 allocations per 1000 rows
+  of a hand-written `database/sql` scan; most remaining allocations come from
+  the driver. Use `SelectAsInto` to avoid the result-slice allocation.
+* Named parameters now support non-ASCII names (`:名前`).
+* `Rows.StructScan` supports changing destination types and returns an error
+  (instead of panicking) for nil/non-pointer destinations.
+* Benchmark suite added in [bench_test.go](bench_test.go).
 
 1.3.0:
 
@@ -38,15 +95,37 @@ to know about it by default.
 
 ### Backwards Compatibility
 
-Compatibility with the most recent two versions of Go is a requirement for any
-new changes.  Compatibility beyond that is not guaranteed.
+This fork requires **Go 1.27.3 or newer**.  API changes are additive where
+possible.  Notable behavioral fixes: `Rows.StructScan` returns an error instead
+of panicking for nil/non-pointer destinations, `Select` clears reused elements,
+named parameters support non-ASCII names, and `GzippedText.Value` reports gzip
+write errors.
 
 Versioning is done with Go modules.  Breaking changes (eg. removing deprecated API)
 will get major version number bumps.
 
 ## install
 
-    go get github.com/jmoiron/sqlx
+    go get github.com/rxxx979/sqlx
+
+```go
+import "github.com/rxxx979/sqlx"
+```
+
+## benchmarks
+
+SQLite benchmarks use `modernc.org/sqlite` and run without external services:
+
+    make bench
+    # or
+    go test -run '^$' -bench . -benchmem ./...
+
+PostgreSQL benchmarks use `pgx` and are skipped unless `SQLX_POSTGRES_DSN` is set:
+
+    export SQLX_POSTGRES_DSN='postgres://user:pass@localhost:5432/db?sslmode=disable'
+    make bench-pg
+
+The PG benchmark suite creates and drops its own `sqlx_bench_person` table.
 
 ## issues
 
@@ -64,7 +143,7 @@ to give columns distinct names, `rows.Scan` to scan them manually, or
 ## usage
 
 Below is an example which shows some common use cases for sqlx.  Check 
-[sqlx_test.go](https://github.com/jmoiron/sqlx/blob/master/sqlx_test.go) for more
+[sqlx_test.go](sqlx_test.go) for more
 usage.
 
 
@@ -76,22 +155,22 @@ import (
     "fmt"
     "log"
     
-    _ "github.com/lib/pq"
-    "github.com/jmoiron/sqlx"
+    _ "github.com/jackc/pgx/v5/stdlib"
+    "github.com/rxxx979/sqlx"
 )
 
-var schema = `
-CREATE TABLE person (
-    first_name text,
-    last_name text,
-    email text
-);
-
-CREATE TABLE place (
-    country text,
-    city text NULL,
-    telcode integer
-)`
+var schema = []string{
+    `CREATE TABLE person (
+        first_name text,
+        last_name text,
+        email text
+    )`,
+    `CREATE TABLE place (
+        country text,
+        city text NULL,
+        telcode integer
+    )`,
+}
 
 type Person struct {
     FirstName string `db:"first_name"`
@@ -108,14 +187,16 @@ type Place struct {
 func main() {
     // this Pings the database trying to connect
     // use sqlx.Open() for sql.Open() semantics
-    db, err := sqlx.Connect("postgres", "user=foo dbname=bar sslmode=disable")
+    db, err := sqlx.Connect("pgx", "postgres://user:pass@localhost:5432/dbname?sslmode=disable")
     if err != nil {
         log.Fatalln(err)
     }
 
-    // exec the schema or fail; multi-statement Exec behavior varies between
-    // database drivers;  pq will exec them all, sqlite3 won't, ymmv
-    db.MustExec(schema)
+    // pgx uses the extended protocol by default and does not accept multiple
+    // statements in one Exec; run each statement separately.
+    for _, stmt := range schema {
+        db.MustExec(stmt)
+    }
     
     tx := db.MustBegin()
     tx.MustExec("INSERT INTO person (first_name, last_name, email) VALUES ($1, $2, $3)", "Jason", "Moiron", "jmoiron@jmoiron.net")
