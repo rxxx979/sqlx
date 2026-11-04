@@ -1,6 +1,7 @@
 package sqlx
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"reflect"
@@ -666,6 +667,59 @@ func BenchmarkSelectAsIntoScalar(b *testing.B) {
 		}
 		if len(out) != benchRows {
 			b.Fatalf("got %d rows", len(out))
+		}
+	}
+}
+
+type noopQueryHook struct{}
+
+func (noopQueryHook) BeforeQuery(context.Context, *QueryEvent) {}
+func (noopQueryHook) AfterQuery(context.Context, *QueryEvent)  {}
+
+// BenchmarkHookDisabled and BenchmarkHookEnabled measure the cost of the hook
+// plumbing itself (the hook bodies are empty).
+func BenchmarkHookDisabled(b *testing.B) {
+	db := benchDB(b)
+	const q = `SELECT id, first_name, last_name, email, score FROM bench_person`
+	var dest []benchPerson
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		dest = dest[:0]
+		if err := db.Select(&dest, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHookEnabled(b *testing.B) {
+	db := benchDB(b)
+	db.SetQueryHook(noopQueryHook{})
+	const q = `SELECT id, first_name, last_name, email, score FROM bench_person`
+	var dest []benchPerson
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		dest = dest[:0]
+		if err := db.Select(&dest, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHookEnabledGet(b *testing.B) {
+	db := benchDB(b)
+	db.SetQueryHook(noopQueryHook{})
+	const q = `SELECT id, first_name, last_name, email, score FROM bench_person WHERE id = ?`
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		var p benchPerson
+		if err := db.Get(&p, q, 500); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

@@ -85,11 +85,11 @@ func (n *NamedStmt) MustExec(arg any) sql.Result {
 // Queryx using this NamedStmt
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) Queryx(arg any) (*Rows, error) {
-	r, err := n.Query(arg)
+	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
 	if err != nil {
 		return nil, err
 	}
-	return &Rows{Rows: r, Mapper: n.Stmt.Mapper, unsafe: isUnsafe(n)}, err
+	return n.Stmt.Queryx(args...)
 }
 
 // QueryRowx this NamedStmt.  Because of limitations with QueryRow, this is

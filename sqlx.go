@@ -1,6 +1,7 @@
 package sqlx
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -216,13 +217,26 @@ type Row struct {
 	unsafe bool
 	rows   *sql.Rows
 	Mapper *reflectx.Mapper
+	obs    *observation
 }
 
 // Scan is a fixed implementation of sql.Row.Scan, which does not discard the
 // underlying error from the internal rows object if it exists.
-func (r *Row) Scan(dest ...any) error {
+func (r *Row) Scan(dest ...any) (err error) {
 	if r.err != nil {
+		if r.obs != nil {
+			r.obs.finish(r.err, 0, 0)
+			r.obs = nil
+		}
 		return r.err
+	}
+
+	var scanned int64
+	if r.obs != nil {
+		defer func() {
+			r.obs.finish(err, scanned, 0)
+			r.obs = nil
+		}()
 	}
 
 	// TODO(bradfitz): for now we need to defensively clone all
@@ -246,17 +260,17 @@ func (r *Row) Scan(dest ...any) error {
 	}
 
 	if !r.rows.Next() {
-		if err := r.rows.Err(); err != nil {
+		if err = r.rows.Err(); err != nil {
 			return err
 		}
 		return sql.ErrNoRows
 	}
-	err := r.rows.Scan(dest...)
-	if err != nil {
+	scanned = 1
+	if err = r.rows.Scan(dest...); err != nil {
 		return err
 	}
 	// Make sure the query can be processed to completion with no errors.
-	if err := r.rows.Close(); err != nil {
+	if err = r.rows.Close(); err != nil {
 		return err
 	}
 	return nil
@@ -281,6 +295,10 @@ func (r *Row) ColumnTypes() ([]*sql.ColumnType, error) {
 
 // Err returns the error encountered while scanning.
 func (r *Row) Err() error {
+	if r.obs != nil {
+		r.obs.finish(r.err, 0, 0)
+		r.obs = nil
+	}
 	return r.err
 }
 
@@ -291,6 +309,7 @@ type DB struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+	hooks      *hookHolder
 }
 
 // NewDb returns a new sqlx DB wrapper for a pre-existing *sql.DB.  The
@@ -298,7 +317,7 @@ type DB struct {
 //
 //lint:ignore ST1003 changing this would break the package interface.
 func NewDb(db *sql.DB, driverName string) *DB {
-	return &DB{DB: db, driverName: driverName, Mapper: mapper()}
+	return &DB{DB: db, driverName: driverName, Mapper: mapper(), hooks: newHookHolder()}
 }
 
 // DriverName returns the driverName passed to the Open function for this DB.
@@ -312,7 +331,7 @@ func Open(driverName, dataSourceName string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{DB: db, driverName: driverName, Mapper: mapper()}, err
+	return &DB{DB: db, driverName: driverName, Mapper: mapper(), hooks: newHookHolder()}, err
 }
 
 // MustOpen is the same as sql.Open, but returns an *sqlx.DB instead and panics on error.
@@ -340,7 +359,7 @@ func (db *DB) Rebind(query string) string {
 // sqlx.Stmt and sqlx.Tx which are created from this DB will inherit its
 // safety behavior.
 func (db *DB) Unsafe() *DB {
-	return &DB{DB: db.DB, driverName: db.driverName, unsafe: true, Mapper: db.Mapper}
+	return &DB{DB: db.DB, driverName: db.driverName, unsafe: true, Mapper: db.Mapper, hooks: db.hooks}
 }
 
 // BindNamed binds a query using the DB driver's bindvar type.
@@ -385,28 +404,88 @@ func (db *DB) MustBegin() *Tx {
 
 // Beginx begins a transaction and returns an *sqlx.Tx instead of an *sql.Tx.
 func (db *DB) Beginx() (*Tx, error) {
-	tx, err := db.DB.Begin()
+	return db.beginTx(context.Background(), nil)
+}
+
+func (db *DB) beginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	obs := db.hooks.start(ctx, db.driverName, OpBegin, "", nil)
+	tx, err := db.DB.BeginTx(ctx, opts)
+	obs.finish(err, 0, 0)
 	if err != nil {
 		return nil, err
 	}
-	return &Tx{Tx: tx, driverName: db.driverName, unsafe: db.unsafe, Mapper: db.Mapper}, err
+	return &Tx{Tx: tx, driverName: db.driverName, unsafe: db.unsafe, Mapper: db.Mapper, hooks: db.hooks}, nil
+}
+
+// Commit commits the transaction and reports it to the configured hook.
+func (tx *Tx) Commit() error {
+	obs := tx.hooks.start(context.Background(), tx.driverName, OpCommit, "", nil)
+	err := tx.Tx.Commit()
+	obs.finish(err, 0, 0)
+	return err
+}
+
+// Rollback aborts the transaction and reports it to the configured hook.
+func (tx *Tx) Rollback() error {
+	obs := tx.hooks.start(context.Background(), tx.driverName, OpRollback, "", nil)
+	err := tx.Tx.Rollback()
+	obs.finish(err, 0, 0)
+	return err
 }
 
 // Queryx queries the database and returns an *sqlx.Rows.
 // Any placeholder parameters are replaced with supplied args.
 func (db *DB) Queryx(query string, args ...any) (*Rows, error) {
-	r, err := db.DB.Query(query, args...)
+	return db.queryxContext(context.Background(), query, args...)
+}
+
+func (db *DB) queryxContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	obs := db.hooks.start(ctx, db.driverName, OpQuery, query, args)
+	r, err := db.DB.QueryContext(ctx, query, args...)
 	if err != nil {
+		obs.finish(err, 0, 0)
 		return nil, err
 	}
-	return &Rows{Rows: r, unsafe: db.unsafe, Mapper: db.Mapper}, err
+	return &Rows{Rows: r, unsafe: db.unsafe, Mapper: db.Mapper, obs: obs}, nil
 }
 
 // QueryRowx queries the database and returns an *sqlx.Row.
 // Any placeholder parameters are replaced with supplied args.
 func (db *DB) QueryRowx(query string, args ...any) *Row {
-	rows, err := db.DB.Query(query, args...)
-	return &Row{rows: rows, err: err, unsafe: db.unsafe, Mapper: db.Mapper}
+	return db.queryRowxContext(context.Background(), query, args...)
+}
+
+func (db *DB) queryRowxContext(ctx context.Context, query string, args ...any) *Row {
+	obs := db.hooks.start(ctx, db.driverName, OpQueryRow, query, args)
+	rows, err := db.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		obs.finish(err, 0, 0)
+	}
+	return &Row{rows: rows, err: err, unsafe: db.unsafe, Mapper: db.Mapper, obs: obs}
+}
+
+// Exec executes a query without returning rows.  The returned sql.Result is
+// available to hooks through QueryEvent.RowsAffected.
+func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
+	return db.execContext(context.Background(), query, args...)
+}
+
+// ExecContext is the context-aware form of Exec.
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return db.execContext(ctx, query, args...)
+}
+
+func (db *DB) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	obs := db.hooks.start(ctx, db.driverName, OpExec, query, args)
+	res, err := db.DB.ExecContext(ctx, query, args...)
+	if obs != nil {
+		var affected int64
+		if res != nil {
+			affected, _ = res.RowsAffected()
+		}
+		obs.finish(err, 0, affected)
+	}
+	return res, err
 }
 
 // MustExec (panic) runs MustExec using this database.
@@ -431,6 +510,7 @@ type Conn struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+	hooks      *hookHolder
 }
 
 // Tx is an sqlx wrapper around sql.Tx with extra functionality
@@ -439,6 +519,7 @@ type Tx struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+	hooks      *hookHolder
 }
 
 // DriverName returns the driverName used by the DB which began this transaction.
@@ -454,7 +535,7 @@ func (tx *Tx) Rebind(query string) string {
 // Unsafe returns a version of Tx which will silently succeed to scan when
 // columns in the SQL result have no fields in the destination struct.
 func (tx *Tx) Unsafe() *Tx {
-	return &Tx{Tx: tx.Tx, driverName: tx.driverName, unsafe: true, Mapper: tx.Mapper}
+	return &Tx{Tx: tx.Tx, driverName: tx.driverName, unsafe: true, Mapper: tx.Mapper, hooks: tx.hooks}
 }
 
 // BindNamed binds a query within a transaction's bindvar type.
@@ -483,18 +564,55 @@ func (tx *Tx) Select(dest any, query string, args ...any) error {
 // Queryx within a transaction.
 // Any placeholder parameters are replaced with supplied args.
 func (tx *Tx) Queryx(query string, args ...any) (*Rows, error) {
-	r, err := tx.Tx.Query(query, args...)
+	return tx.queryxContext(context.Background(), query, args...)
+}
+
+func (tx *Tx) queryxContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	obs := tx.hooks.start(ctx, tx.driverName, OpQuery, query, args)
+	r, err := tx.Tx.QueryContext(ctx, query, args...)
 	if err != nil {
+		obs.finish(err, 0, 0)
 		return nil, err
 	}
-	return &Rows{Rows: r, unsafe: tx.unsafe, Mapper: tx.Mapper}, err
+	return &Rows{Rows: r, unsafe: tx.unsafe, Mapper: tx.Mapper, obs: obs}, nil
 }
 
 // QueryRowx within a transaction.
 // Any placeholder parameters are replaced with supplied args.
 func (tx *Tx) QueryRowx(query string, args ...any) *Row {
-	rows, err := tx.Tx.Query(query, args...)
-	return &Row{rows: rows, err: err, unsafe: tx.unsafe, Mapper: tx.Mapper}
+	return tx.queryRowxContext(context.Background(), query, args...)
+}
+
+func (tx *Tx) queryRowxContext(ctx context.Context, query string, args ...any) *Row {
+	obs := tx.hooks.start(ctx, tx.driverName, OpQueryRow, query, args)
+	rows, err := tx.Tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		obs.finish(err, 0, 0)
+	}
+	return &Row{rows: rows, err: err, unsafe: tx.unsafe, Mapper: tx.Mapper, obs: obs}
+}
+
+// Exec executes a query within a transaction without returning rows.
+func (tx *Tx) Exec(query string, args ...any) (sql.Result, error) {
+	return tx.execContext(context.Background(), query, args...)
+}
+
+// ExecContext is the context-aware form of Exec for a transaction.
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return tx.execContext(ctx, query, args...)
+}
+
+func (tx *Tx) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	obs := tx.hooks.start(ctx, tx.driverName, OpExec, query, args)
+	res, err := tx.Tx.ExecContext(ctx, query, args...)
+	if obs != nil {
+		var affected int64
+		if res != nil {
+			affected, _ = res.RowsAffected()
+		}
+		obs.finish(err, 0, affected)
+	}
+	return res, err
 }
 
 // Get within a transaction.
@@ -519,17 +637,25 @@ func (tx *Tx) Preparex(query string) (*Stmt, error) {
 // stmt can be either *sql.Stmt or *sqlx.Stmt.
 func (tx *Tx) Stmtx(stmt any) *Stmt {
 	var s *sql.Stmt
+	var query, driverName string
+	var hooks *hookHolder
 	switch v := stmt.(type) {
 	case Stmt:
-		s = v.Stmt
+		s, query, driverName, hooks = v.Stmt, v.query, v.driverName, v.hooks
 	case *Stmt:
-		s = v.Stmt
+		s, query, driverName, hooks = v.Stmt, v.query, v.driverName, v.hooks
 	case *sql.Stmt:
 		s = v
 	default:
 		panic(fmt.Sprintf("non-statement type %v passed to Stmtx", reflect.ValueOf(stmt).Type()))
 	}
-	return &Stmt{Stmt: tx.Stmt(s), Mapper: tx.Mapper}
+	if driverName == "" {
+		driverName = tx.driverName
+	}
+	if hooks == nil {
+		hooks = tx.hooks
+	}
+	return &Stmt{Stmt: tx.Stmt(s), Mapper: tx.Mapper, driverName: driverName, query: query, hooks: hooks}
 }
 
 // NamedStmt returns a version of the prepared statement which runs within a transaction.
@@ -549,14 +675,17 @@ func (tx *Tx) PrepareNamed(query string) (*NamedStmt, error) {
 // Stmt is an sqlx wrapper around sql.Stmt with extra functionality
 type Stmt struct {
 	*sql.Stmt
-	unsafe bool
-	Mapper *reflectx.Mapper
+	unsafe     bool
+	Mapper     *reflectx.Mapper
+	driverName string
+	query      string
+	hooks      *hookHolder
 }
 
 // Unsafe returns a version of Stmt which will silently succeed to scan when
 // columns in the SQL result have no fields in the destination struct.
 func (s *Stmt) Unsafe() *Stmt {
-	return &Stmt{Stmt: s.Stmt, unsafe: true, Mapper: s.Mapper}
+	return &Stmt{Stmt: s.Stmt, unsafe: true, Mapper: s.Mapper, driverName: s.driverName, query: s.query, hooks: s.hooks}
 }
 
 // Select using the prepared statement.
@@ -579,18 +708,78 @@ func (s *Stmt) MustExec(args ...any) sql.Result {
 	return MustExec(&qStmt{s}, "", args...)
 }
 
+// Query executes the prepared statement and returns *sql.Rows.
+//
+// Hooks see this operation as OpQuery and are notified when Query returns; the
+// returned *sql.Rows is not an sqlx.Rows, so RowsScanned is not available.
+func (s *Stmt) Query(args ...any) (*sql.Rows, error) {
+	return s.queryContext(context.Background(), args...)
+}
+
+// QueryContext is the context-aware form of Query.
+func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*sql.Rows, error) {
+	return s.queryContext(ctx, args...)
+}
+
+func (s *Stmt) queryContext(ctx context.Context, args ...any) (*sql.Rows, error) {
+	obs := s.hooks.start(ctx, s.driverName, OpQuery, s.query, args)
+	r, err := s.Stmt.QueryContext(ctx, args...)
+	obs.finish(err, 0, 0)
+	return r, err
+}
+
 // QueryRowx using this statement.
 // Any placeholder parameters are replaced with supplied args.
 func (s *Stmt) QueryRowx(args ...any) *Row {
-	qs := &qStmt{s}
-	return qs.QueryRowx("", args...)
+	return s.queryRowxContext(context.Background(), args...)
+}
+
+func (s *Stmt) queryRowxContext(ctx context.Context, args ...any) *Row {
+	obs := s.hooks.start(ctx, s.driverName, OpQueryRow, s.query, args)
+	rows, err := s.Stmt.QueryContext(ctx, args...)
+	if err != nil {
+		obs.finish(err, 0, 0)
+	}
+	return &Row{rows: rows, err: err, unsafe: s.unsafe, Mapper: s.Mapper, obs: obs}
 }
 
 // Queryx using this statement.
 // Any placeholder parameters are replaced with supplied args.
 func (s *Stmt) Queryx(args ...any) (*Rows, error) {
-	qs := &qStmt{s}
-	return qs.Queryx("", args...)
+	return s.queryxContext(context.Background(), args...)
+}
+
+func (s *Stmt) queryxContext(ctx context.Context, args ...any) (*Rows, error) {
+	obs := s.hooks.start(ctx, s.driverName, OpQuery, s.query, args)
+	r, err := s.Stmt.QueryContext(ctx, args...)
+	if err != nil {
+		obs.finish(err, 0, 0)
+		return nil, err
+	}
+	return &Rows{Rows: r, unsafe: s.unsafe, Mapper: s.Mapper, obs: obs}, nil
+}
+
+// Exec executes the prepared statement.
+func (s *Stmt) Exec(args ...any) (sql.Result, error) {
+	return s.execContext(context.Background(), args...)
+}
+
+// ExecContext is the context-aware form of Exec.
+func (s *Stmt) ExecContext(ctx context.Context, args ...any) (sql.Result, error) {
+	return s.execContext(ctx, args...)
+}
+
+func (s *Stmt) execContext(ctx context.Context, args ...any) (sql.Result, error) {
+	obs := s.hooks.start(ctx, s.driverName, OpExec, s.query, args)
+	res, err := s.Stmt.ExecContext(ctx, args...)
+	if obs != nil {
+		var affected int64
+		if res != nil {
+			affected, _ = res.RowsAffected()
+		}
+		obs.finish(err, 0, affected)
+	}
+	return res, err
 }
 
 // qStmt is an unexposed wrapper which lets you use a Stmt as a Queryer & Execer by
@@ -602,16 +791,11 @@ func (q *qStmt) Query(query string, args ...any) (*sql.Rows, error) {
 }
 
 func (q *qStmt) Queryx(query string, args ...any) (*Rows, error) {
-	r, err := q.Stmt.Query(args...)
-	if err != nil {
-		return nil, err
-	}
-	return &Rows{Rows: r, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}, err
+	return q.Stmt.Queryx(args...)
 }
 
 func (q *qStmt) QueryRowx(query string, args ...any) *Row {
-	rows, err := q.Stmt.Query(args...)
-	return &Row{rows: rows, err: err, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}
+	return q.Stmt.QueryRowx(args...)
 }
 
 func (q *qStmt) Exec(query string, args ...any) (sql.Result, error) {
@@ -638,6 +822,33 @@ type Rows struct {
 	// reuses the same destination (the common loop case) the field pointers in
 	// values remain valid and do not need to be rebuilt for every row.
 	lastAddr uintptr
+	obs      *observation
+	scanned  int64
+}
+
+// Next advances to the next row and counts consumed rows for QueryHook.
+func (r *Rows) Next() bool {
+	if r.Rows.Next() {
+		if r.obs != nil {
+			r.scanned++
+		}
+		return true
+	}
+	return false
+}
+
+// Close closes the underlying rows and finishes the QueryHook observation.
+func (r *Rows) Close() error {
+	err := r.Rows.Close()
+	if o := r.obs; o != nil {
+		obsErr := err
+		if obsErr == nil {
+			obsErr = r.Rows.Err()
+		}
+		o.finish(obsErr, r.scanned, 0)
+		r.obs = nil
+	}
+	return err
 }
 
 // SliceScan using this Rows.
@@ -737,11 +948,17 @@ func MustConnect(driverName, dataSourceName string) *DB {
 
 // Preparex prepares a statement.
 func Preparex(p Preparer, query string) (*Stmt, error) {
+	hooks := hooksFor(p)
+	driverName := driverNameFor(p)
+	obs := hooks.start(context.Background(), driverName, OpPrepare, query, nil)
 	s, err := p.Prepare(query)
 	if err != nil {
+		obs.finish(err, 0, 0)
 		return nil, err
 	}
-	return &Stmt{Stmt: s, unsafe: isUnsafe(p), Mapper: mapperFor(p)}, err
+	stmt := &Stmt{Stmt: s, unsafe: isUnsafe(p), Mapper: mapperFor(p), driverName: driverName, query: query, hooks: hooks}
+	obs.finish(nil, 0, 0)
+	return stmt, nil
 }
 
 // Select executes a query using the provided Queryer, and StructScans each row
