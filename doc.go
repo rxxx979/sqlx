@@ -8,4 +8,7 @@
 // Additions include scanning into structs, named query support, rebinding
 // queries for different drivers, convenient shorthands for common error handling
 // and more.
+//
+// Generic helpers such as [GetAs] and [SelectAs] return values directly, and
+// [SelectIter] streams rows as an iterator.  This fork requires Go 1.27.
 package sqlx

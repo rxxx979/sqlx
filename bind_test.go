@@ -11,7 +11,7 @@ func oldBindType(driverName string) int {
 		return DOLLAR
 	case "mysql":
 		return QUESTION
-	case "sqlite3":
+	case "sqlite", "sqlite3":
 		return QUESTION
 	case "oci8", "ora", "goracle", "godror":
 		return NAMED
@@ -26,7 +26,7 @@ sync.Map implementation:
 
 goos: linux
 goarch: amd64
-pkg: github.com/jmoiron/sqlx
+pkg: github.com/rxxx979/sqlx
 BenchmarkBindSpeed/old-4         	100000000	        11.0 ns/op
 BenchmarkBindSpeed/new-4         	24575726	        50.8 ns/op
 
@@ -35,14 +35,14 @@ async.Value map implementation:
 
 goos: linux
 goarch: amd64
-pkg: github.com/jmoiron/sqlx
+pkg: github.com/rxxx979/sqlx
 BenchmarkBindSpeed/old-4         	100000000	        11.0 ns/op
 BenchmarkBindSpeed/new-4         	42535839	        27.5 ns/op
 */
 
 func BenchmarkBindSpeed(b *testing.B) {
 	testDrivers := []string{
-		"postgres", "pgx", "mysql", "sqlite3", "ora", "sqlserver",
+		"postgres", "pgx", "mysql", "sqlite", "sqlite3", "ora", "sqlserver",
 	}
 
 	b.Run("old", func(b *testing.B) {

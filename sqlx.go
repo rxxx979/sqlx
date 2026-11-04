@@ -5,13 +5,15 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/rxxx979/sqlx/reflectx"
 )
 
 // Although the NameMapper is convenient, in practice it should not
@@ -24,28 +26,50 @@ import (
 // to whatever you want, but it is encouraged to be set before sqlx is used
 // as name-to-field mappings are cached after first use on a type.
 var NameMapper = strings.ToLower
-var origMapper = reflect.ValueOf(NameMapper)
+
+// mapperState keeps the current default mapper together with the NameMapper
+// func it was built from, so the hot path can detect changes without taking a
+// lock.
+type mapperState struct {
+	mapper *reflectx.Mapper
+	fn     reflect.Value
+}
 
 // Rather than creating on init, this is created when necessary so that
 // importers have time to customize the NameMapper.
-var mpr *reflectx.Mapper
+var mpr atomic.Pointer[mapperState]
 
-// mprMu protects mpr.
+// mprMu serializes rebuilding mpr.  It is only taken when NameMapper changes,
+// which normally happens once at startup (or never).
 var mprMu sync.Mutex
 
 // mapper returns a valid mapper using the configured NameMapper func.
 func mapper() *reflectx.Mapper {
+	fn := NameMapper
+	rv := reflect.ValueOf(fn)
+	if s := mpr.Load(); s != nil && s.fn == rv {
+		return s.mapper
+	}
+	return rebuildMapper(fn, rv)
+}
+
+func rebuildMapper(fn func(string) string, rv reflect.Value) *reflectx.Mapper {
 	mprMu.Lock()
 	defer mprMu.Unlock()
 
-	if mpr == nil {
-		mpr = reflectx.NewMapperFunc("db", NameMapper)
-	} else if origMapper != reflect.ValueOf(NameMapper) {
-		// if NameMapper has changed, create a new mapper
-		mpr = reflectx.NewMapperFunc("db", NameMapper)
-		origMapper = reflect.ValueOf(NameMapper)
+	// Re-check now that we hold the lock: another goroutine may have rebuilt
+	// the mapper while we were waiting.
+	if s := mpr.Load(); s != nil && s.fn == rv {
+		return s.mapper
 	}
-	return mpr
+
+	// Build from the func value read by the caller, and store that same value
+	// with the mapper.  If NameMapper is reassigned concurrently the next call
+	// sees a mismatch and rebuilds, instead of silently keeping a mapper built
+	// with a different function.
+	m := reflectx.NewMapperFunc("db", fn)
+	mpr.Store(&mapperState{mapper: m, fn: rv})
+	return m
 }
 
 // isScannable takes the reflect.Type and the actual dest value and returns
@@ -54,7 +78,7 @@ func mapper() *reflectx.Mapper {
 //   - it implements sql.Scanner
 //   - it has no exported fields
 func isScannable(t reflect.Type) bool {
-	if reflect.PtrTo(t).Implements(_scannerInterface) {
+	if reflect.PointerTo(t).Implements(_scannerInterface) {
 		return true
 	}
 	if t.Kind() != reflect.Struct {
@@ -69,27 +93,48 @@ func isScannable(t reflect.Type) bool {
 // ColScanner is an interface used by MapScan and SliceScan
 type ColScanner interface {
 	Columns() ([]string, error)
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 	Err() error
 }
 
 // Queryer is an interface used by Get and Select
 type Queryer interface {
-	Query(query string, args ...interface{}) (*sql.Rows, error)
-	Queryx(query string, args ...interface{}) (*Rows, error)
-	QueryRowx(query string, args ...interface{}) *Row
+	Query(query string, args ...any) (*sql.Rows, error)
+	Queryx(query string, args ...any) (*Rows, error)
+	QueryRowx(query string, args ...any) *Row
 }
 
 // Execer is an interface used by MustExec and LoadFile
 type Execer interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// RowScanner can be implemented by a destination type to scan the current row
+// without reflection.  Implementations are normally generated for *T and must
+// scan exactly one row; they must not call Next on rows.  When a destination
+// implements RowScanner, sqlx bypasses its column-to-field planning entirely.
+//
+// A generated implementation for a type T looks like:
+//
+//	func (p *Person) ScanRow(rows *sql.Rows) error {
+//		return rows.Scan(&p.ID, &p.FirstName, &p.LastName)
+//	}
+type RowScanner interface {
+	ScanRow(rows *sql.Rows) error
+}
+
+// StructBinder can be implemented by a struct argument to bind named query
+// arguments without reflection.  BindArgs must return one value per name, in
+// the same order as names.  Implementations are normally generated.
+type StructBinder interface {
+	BindArgs(names []string) ([]any, error)
 }
 
 // Binder is an interface for something which can bind queries (Tx, DB)
 type binder interface {
 	DriverName() string
 	Rebind(string) string
-	BindNamed(string, interface{}) (string, []interface{}, error)
+	BindNamed(string, any) (string, []any, error)
 }
 
 // Ext is a union interface which can bind, query, and exec, used by
@@ -106,7 +151,7 @@ type Preparer interface {
 }
 
 // determine if any of our extensions are unsafe
-func isUnsafe(i interface{}) bool {
+func isUnsafe(i any) bool {
 	switch v := i.(type) {
 	case Row:
 		return v.unsafe
@@ -143,7 +188,7 @@ func isUnsafe(i interface{}) bool {
 	}
 }
 
-func mapperFor(i interface{}) *reflectx.Mapper {
+func mapperFor(i any) *reflectx.Mapper {
 	switch i := i.(type) {
 	case DB:
 		return i.Mapper
@@ -158,10 +203,11 @@ func mapperFor(i interface{}) *reflectx.Mapper {
 	}
 }
 
-var _scannerInterface = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
+var _scannerInterface = reflect.TypeFor[sql.Scanner]()
+var _rowScannerType = reflect.TypeFor[RowScanner]()
 
 //lint:ignore U1000 ignoring this for now
-var _valuerInterface = reflect.TypeOf((*driver.Valuer)(nil)).Elem()
+var _valuerInterface = reflect.TypeFor[driver.Valuer]()
 
 // Row is a reimplementation of sql.Row in order to gain access to the underlying
 // sql.Rows.Columns() data, necessary for StructScan.
@@ -174,7 +220,7 @@ type Row struct {
 
 // Scan is a fixed implementation of sql.Row.Scan, which does not discard the
 // underlying error from the internal rows object if it exists.
-func (r *Row) Scan(dest ...interface{}) error {
+func (r *Row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -298,32 +344,32 @@ func (db *DB) Unsafe() *DB {
 }
 
 // BindNamed binds a query using the DB driver's bindvar type.
-func (db *DB) BindNamed(query string, arg interface{}) (string, []interface{}, error) {
+func (db *DB) BindNamed(query string, arg any) (string, []any, error) {
 	return bindNamedMapper(BindType(db.driverName), query, arg, db.Mapper)
 }
 
 // NamedQuery using this DB.
 // Any named placeholder parameters are replaced with fields from arg.
-func (db *DB) NamedQuery(query string, arg interface{}) (*Rows, error) {
+func (db *DB) NamedQuery(query string, arg any) (*Rows, error) {
 	return NamedQuery(db, query, arg)
 }
 
 // NamedExec using this DB.
 // Any named placeholder parameters are replaced with fields from arg.
-func (db *DB) NamedExec(query string, arg interface{}) (sql.Result, error) {
+func (db *DB) NamedExec(query string, arg any) (sql.Result, error) {
 	return NamedExec(db, query, arg)
 }
 
 // Select using this DB.
 // Any placeholder parameters are replaced with supplied args.
-func (db *DB) Select(dest interface{}, query string, args ...interface{}) error {
+func (db *DB) Select(dest any, query string, args ...any) error {
 	return Select(db, dest, query, args...)
 }
 
 // Get using this DB.
 // Any placeholder parameters are replaced with supplied args.
 // An error is returned if the result set is empty.
-func (db *DB) Get(dest interface{}, query string, args ...interface{}) error {
+func (db *DB) Get(dest any, query string, args ...any) error {
 	return Get(db, dest, query, args...)
 }
 
@@ -348,7 +394,7 @@ func (db *DB) Beginx() (*Tx, error) {
 
 // Queryx queries the database and returns an *sqlx.Rows.
 // Any placeholder parameters are replaced with supplied args.
-func (db *DB) Queryx(query string, args ...interface{}) (*Rows, error) {
+func (db *DB) Queryx(query string, args ...any) (*Rows, error) {
 	r, err := db.DB.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -358,14 +404,14 @@ func (db *DB) Queryx(query string, args ...interface{}) (*Rows, error) {
 
 // QueryRowx queries the database and returns an *sqlx.Row.
 // Any placeholder parameters are replaced with supplied args.
-func (db *DB) QueryRowx(query string, args ...interface{}) *Row {
+func (db *DB) QueryRowx(query string, args ...any) *Row {
 	rows, err := db.DB.Query(query, args...)
 	return &Row{rows: rows, err: err, unsafe: db.unsafe, Mapper: db.Mapper}
 }
 
 // MustExec (panic) runs MustExec using this database.
 // Any placeholder parameters are replaced with supplied args.
-func (db *DB) MustExec(query string, args ...interface{}) sql.Result {
+func (db *DB) MustExec(query string, args ...any) sql.Result {
 	return MustExec(db, query, args...)
 }
 
@@ -412,31 +458,31 @@ func (tx *Tx) Unsafe() *Tx {
 }
 
 // BindNamed binds a query within a transaction's bindvar type.
-func (tx *Tx) BindNamed(query string, arg interface{}) (string, []interface{}, error) {
+func (tx *Tx) BindNamed(query string, arg any) (string, []any, error) {
 	return bindNamedMapper(BindType(tx.driverName), query, arg, tx.Mapper)
 }
 
 // NamedQuery within a transaction.
 // Any named placeholder parameters are replaced with fields from arg.
-func (tx *Tx) NamedQuery(query string, arg interface{}) (*Rows, error) {
+func (tx *Tx) NamedQuery(query string, arg any) (*Rows, error) {
 	return NamedQuery(tx, query, arg)
 }
 
 // NamedExec a named query within a transaction.
 // Any named placeholder parameters are replaced with fields from arg.
-func (tx *Tx) NamedExec(query string, arg interface{}) (sql.Result, error) {
+func (tx *Tx) NamedExec(query string, arg any) (sql.Result, error) {
 	return NamedExec(tx, query, arg)
 }
 
 // Select within a transaction.
 // Any placeholder parameters are replaced with supplied args.
-func (tx *Tx) Select(dest interface{}, query string, args ...interface{}) error {
+func (tx *Tx) Select(dest any, query string, args ...any) error {
 	return Select(tx, dest, query, args...)
 }
 
 // Queryx within a transaction.
 // Any placeholder parameters are replaced with supplied args.
-func (tx *Tx) Queryx(query string, args ...interface{}) (*Rows, error) {
+func (tx *Tx) Queryx(query string, args ...any) (*Rows, error) {
 	r, err := tx.Tx.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -446,7 +492,7 @@ func (tx *Tx) Queryx(query string, args ...interface{}) (*Rows, error) {
 
 // QueryRowx within a transaction.
 // Any placeholder parameters are replaced with supplied args.
-func (tx *Tx) QueryRowx(query string, args ...interface{}) *Row {
+func (tx *Tx) QueryRowx(query string, args ...any) *Row {
 	rows, err := tx.Tx.Query(query, args...)
 	return &Row{rows: rows, err: err, unsafe: tx.unsafe, Mapper: tx.Mapper}
 }
@@ -454,13 +500,13 @@ func (tx *Tx) QueryRowx(query string, args ...interface{}) *Row {
 // Get within a transaction.
 // Any placeholder parameters are replaced with supplied args.
 // An error is returned if the result set is empty.
-func (tx *Tx) Get(dest interface{}, query string, args ...interface{}) error {
+func (tx *Tx) Get(dest any, query string, args ...any) error {
 	return Get(tx, dest, query, args...)
 }
 
 // MustExec runs MustExec within a transaction.
 // Any placeholder parameters are replaced with supplied args.
-func (tx *Tx) MustExec(query string, args ...interface{}) sql.Result {
+func (tx *Tx) MustExec(query string, args ...any) sql.Result {
 	return MustExec(tx, query, args...)
 }
 
@@ -471,7 +517,7 @@ func (tx *Tx) Preparex(query string) (*Stmt, error) {
 
 // Stmtx returns a version of the prepared statement which runs within a transaction.  Provided
 // stmt can be either *sql.Stmt or *sqlx.Stmt.
-func (tx *Tx) Stmtx(stmt interface{}) *Stmt {
+func (tx *Tx) Stmtx(stmt any) *Stmt {
 	var s *sql.Stmt
 	switch v := stmt.(type) {
 	case Stmt:
@@ -515,34 +561,34 @@ func (s *Stmt) Unsafe() *Stmt {
 
 // Select using the prepared statement.
 // Any placeholder parameters are replaced with supplied args.
-func (s *Stmt) Select(dest interface{}, args ...interface{}) error {
+func (s *Stmt) Select(dest any, args ...any) error {
 	return Select(&qStmt{s}, dest, "", args...)
 }
 
 // Get using the prepared statement.
 // Any placeholder parameters are replaced with supplied args.
 // An error is returned if the result set is empty.
-func (s *Stmt) Get(dest interface{}, args ...interface{}) error {
+func (s *Stmt) Get(dest any, args ...any) error {
 	return Get(&qStmt{s}, dest, "", args...)
 }
 
 // MustExec (panic) using this statement.  Note that the query portion of the error
 // output will be blank, as Stmt does not expose its query.
 // Any placeholder parameters are replaced with supplied args.
-func (s *Stmt) MustExec(args ...interface{}) sql.Result {
+func (s *Stmt) MustExec(args ...any) sql.Result {
 	return MustExec(&qStmt{s}, "", args...)
 }
 
 // QueryRowx using this statement.
 // Any placeholder parameters are replaced with supplied args.
-func (s *Stmt) QueryRowx(args ...interface{}) *Row {
+func (s *Stmt) QueryRowx(args ...any) *Row {
 	qs := &qStmt{s}
 	return qs.QueryRowx("", args...)
 }
 
 // Queryx using this statement.
 // Any placeholder parameters are replaced with supplied args.
-func (s *Stmt) Queryx(args ...interface{}) (*Rows, error) {
+func (s *Stmt) Queryx(args ...any) (*Rows, error) {
 	qs := &qStmt{s}
 	return qs.Queryx("", args...)
 }
@@ -551,11 +597,11 @@ func (s *Stmt) Queryx(args ...interface{}) (*Rows, error) {
 // implementing those interfaces and ignoring the `query` argument.
 type qStmt struct{ *Stmt }
 
-func (q *qStmt) Query(query string, args ...interface{}) (*sql.Rows, error) {
+func (q *qStmt) Query(query string, args ...any) (*sql.Rows, error) {
 	return q.Stmt.Query(args...)
 }
 
-func (q *qStmt) Queryx(query string, args ...interface{}) (*Rows, error) {
+func (q *qStmt) Queryx(query string, args ...any) (*Rows, error) {
 	r, err := q.Stmt.Query(args...)
 	if err != nil {
 		return nil, err
@@ -563,12 +609,12 @@ func (q *qStmt) Queryx(query string, args ...interface{}) (*Rows, error) {
 	return &Rows{Rows: r, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}, err
 }
 
-func (q *qStmt) QueryRowx(query string, args ...interface{}) *Row {
+func (q *qStmt) QueryRowx(query string, args ...any) *Row {
 	rows, err := q.Stmt.Query(args...)
 	return &Row{rows: rows, err: err, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}
 }
 
-func (q *qStmt) Exec(query string, args ...interface{}) (sql.Result, error) {
+func (q *qStmt) Exec(query string, args ...any) (sql.Result, error) {
 	return q.Stmt.Exec(args...)
 }
 
@@ -580,56 +626,86 @@ type Rows struct {
 	Mapper *reflectx.Mapper
 	// these fields cache memory use for a rows during iteration w/ structScan
 	started bool
-	fields  [][]int
-	values  []interface{}
+	// destType is the type of the last StructScan destination.  StructScan
+	// supports being called with different destination types (and even
+	// different columns) by rebuilding the plan when they change.
+	destType reflect.Type
+	fields   []*reflectx.FieldInfo
+	values   []any
+	// scanAs caches the scratch state used by ScanAs.
+	scanAs any
+	// lastAddr is the address of the last destination struct.  When a caller
+	// reuses the same destination (the common loop case) the field pointers in
+	// values remain valid and do not need to be rebuilt for every row.
+	lastAddr uintptr
 }
 
 // SliceScan using this Rows.
-func (r *Rows) SliceScan() ([]interface{}, error) {
+func (r *Rows) SliceScan() ([]any, error) {
 	return SliceScan(r)
 }
 
 // MapScan using this Rows.
-func (r *Rows) MapScan(dest map[string]interface{}) error {
+func (r *Rows) MapScan(dest map[string]any) error {
 	return MapScan(r, dest)
 }
 
 // StructScan is like sql.Rows.Scan, but scans a single Row into a single Struct.
 // Use this and iterate over Rows manually when the memory load of Select() might be
 // prohibitive.  *Rows.StructScan caches the reflect work of matching up column
-// positions to fields to avoid that overhead per scan, which means it is not safe
-// to run StructScan on the same Rows instance with different struct types.
-func (r *Rows) StructScan(dest interface{}) error {
+// positions to fields to avoid that overhead per scan.
+//
+// Reusing the same destination value across iterations (for example a struct
+// declared before the loop) makes repeated scans allocation-free: subsequent
+// scans only refresh the value, they do not rebuild field pointers.  Calling
+// StructScan with a different destination type rebuilds the column plan, so it
+// is safe to do, though usually unnecessary.
+func (r *Rows) StructScan(dest any) error {
 	v := reflect.ValueOf(dest)
 
-	if v.Kind() != reflect.Ptr {
+	if v.Kind() != reflect.Pointer {
 		return errors.New("must pass a pointer, not a value, to StructScan destination")
+	}
+	if v.IsNil() {
+		return errors.New("nil pointer passed to StructScan destination")
+	}
+
+	if scanner, ok := dest.(RowScanner); ok {
+		return scanner.ScanRow(r.Rows)
 	}
 
 	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return fmt.Errorf("non-struct destination type %s passed to StructScan", v.Kind())
+	}
 
-	if !r.started {
+	if !r.started || r.destType != v.Type() {
 		columns, err := r.Columns()
 		if err != nil {
 			return err
 		}
 		m := r.Mapper
 
-		r.fields = m.TraversalsByName(v.Type(), columns)
+		r.fields = m.FieldInfosByName(v.Type(), columns)
 		// if we are not unsafe and are missing fields, return an error
 		if f, err := missingFields(r.fields); err != nil && !r.unsafe {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
-		r.values = make([]interface{}, len(columns))
+		r.values = make([]any, len(columns))
 		r.started = true
+		r.destType = v.Type()
+		r.lastAddr = 0
 	}
 
-	err := fieldsByTraversal(v, r.fields, r.values, true)
-	if err != nil {
-		return err
+	if addr := v.UnsafeAddr(); addr != r.lastAddr {
+		if err := fieldPointers(v, r.fields, r.values); err != nil {
+			return err
+		}
+		r.lastAddr = addr
 	}
+
 	// scan into the struct field pointers and append to our results
-	err = r.Scan(r.values...)
+	err := r.Scan(r.values...)
 	if err != nil {
 		return err
 	}
@@ -673,7 +749,7 @@ func Preparex(p Preparer, query string) (*Stmt, error) {
 // the result set must have only one column.  Otherwise, StructScan is used.
 // The *sql.Rows are closed automatically.
 // Any placeholder parameters are replaced with supplied args.
-func Select(q Queryer, dest interface{}, query string, args ...interface{}) error {
+func Select(q Queryer, dest any, query string, args ...any) error {
 	rows, err := q.Queryx(query, args...)
 	if err != nil {
 		return err
@@ -688,7 +764,7 @@ func Select(q Queryer, dest interface{}, query string, args ...interface{}) erro
 // StructScan is used.  Get will return sql.ErrNoRows like row.Scan would.
 // Any placeholder parameters are replaced with supplied args.
 // An error is returned if the result set is empty.
-func Get(q Queryer, dest interface{}, query string, args ...interface{}) error {
+func Get(q Queryer, dest any, query string, args ...any) error {
 	r := q.QueryRowx(query, args...)
 	return r.scanAny(dest, false)
 }
@@ -699,8 +775,8 @@ func Get(q Queryer, dest interface{}, query string, args ...interface{}) error {
 // is not suitable for loading large data dumps, but can be useful for initializing
 // schemas or loading indexes.
 //
-// FIXME: this does not really work with multi-statement files for mattn/go-sqlite3
-// or the go-mysql-driver/mysql drivers;  pq seems to be an exception here.  Detecting
+// FIXME: this does not really work with multi-statement files for modernc.org/sqlite
+// or the go-mysql-driver/mysql drivers;  drivers using the simple protocol may be an exception.  Detecting
 // this by requiring something with DriverName() and then attempting to split the
 // queries will be difficult to get right, and its current driver-specific behavior
 // is deemed at least not complex in its incorrectness.
@@ -709,7 +785,7 @@ func LoadFile(e Execer, path string) (*sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	contents, err := ioutil.ReadFile(realpath)
+	contents, err := os.ReadFile(realpath)
 	if err != nil {
 		return nil, err
 	}
@@ -719,7 +795,7 @@ func LoadFile(e Execer, path string) (*sql.Result, error) {
 
 // MustExec execs the query using e and panics if there was an error.
 // Any placeholder parameters are replaced with supplied args.
-func MustExec(e Execer, query string, args ...interface{}) sql.Result {
+func MustExec(e Execer, query string, args ...any) sql.Result {
 	res, err := e.Exec(query, args...)
 	if err != nil {
 		panic(err)
@@ -728,16 +804,16 @@ func MustExec(e Execer, query string, args ...interface{}) sql.Result {
 }
 
 // SliceScan using this Rows.
-func (r *Row) SliceScan() ([]interface{}, error) {
+func (r *Row) SliceScan() ([]any, error) {
 	return SliceScan(r)
 }
 
 // MapScan using this Rows.
-func (r *Row) MapScan(dest map[string]interface{}) error {
+func (r *Row) MapScan(dest map[string]any) error {
 	return MapScan(r, dest)
 }
 
-func (r *Row) scanAny(dest interface{}, structOnly bool) error {
+func (r *Row) scanAny(dest any, structOnly bool) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -748,11 +824,24 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 	defer r.rows.Close()
 
 	v := reflect.ValueOf(dest)
-	if v.Kind() != reflect.Ptr {
+	if v.Kind() != reflect.Pointer {
 		return errors.New("must pass a pointer, not a value, to StructScan destination")
 	}
 	if v.IsNil() {
 		return errors.New("nil pointer passed to StructScan destination")
+	}
+
+	if scanner, ok := dest.(RowScanner); ok {
+		if !r.rows.Next() {
+			if err := r.rows.Err(); err != nil {
+				return err
+			}
+			return sql.ErrNoRows
+		}
+		if err := scanner.ScanRow(r.rows); err != nil {
+			return err
+		}
+		return r.rows.Close()
 	}
 
 	base := reflectx.Deref(v.Type())
@@ -777,14 +866,14 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 
 	m := r.Mapper
 
-	fields := m.TraversalsByName(v.Type(), columns)
+	fields := m.FieldInfosByName(v.Type(), columns)
 	// if we are not unsafe and are missing fields, return an error
 	if f, err := missingFields(fields); err != nil && !r.unsafe {
 		return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 	}
-	values := make([]interface{}, len(columns))
+	values := make([]any, len(columns))
 
-	err = fieldsByTraversal(v, fields, values, true)
+	err = fieldPointers(v, fields, values)
 	if err != nil {
 		return err
 	}
@@ -793,25 +882,25 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 }
 
 // StructScan a single Row into dest.
-func (r *Row) StructScan(dest interface{}) error {
+func (r *Row) StructScan(dest any) error {
 	return r.scanAny(dest, true)
 }
 
-// SliceScan a row, returning a []interface{} with values similar to MapScan.
+// SliceScan a row, returning a []any with values similar to MapScan.
 // This function is primarily intended for use where the number of columns
-// is not known.  Because you can pass an []interface{} directly to Scan,
+// is not known.  Because you can pass an []any directly to Scan,
 // it's recommended that you do that as it will not have to allocate new
 // slices per row.
-func SliceScan(r ColScanner) ([]interface{}, error) {
+func SliceScan(r ColScanner) ([]any, error) {
 	// ignore r.started, since we needn't use reflect for anything.
 	columns, err := r.Columns()
 	if err != nil {
-		return []interface{}{}, err
+		return []any{}, err
 	}
 
-	values := make([]interface{}, len(columns))
+	values := make([]any, len(columns))
 	for i := range values {
-		values[i] = new(interface{})
+		values[i] = new(any)
 	}
 
 	err = r.Scan(values...)
@@ -821,29 +910,29 @@ func SliceScan(r ColScanner) ([]interface{}, error) {
 	}
 
 	for i := range columns {
-		values[i] = *(values[i].(*interface{}))
+		values[i] = *(values[i].(*any))
 	}
 
 	return values, r.Err()
 }
 
-// MapScan scans a single Row into the dest map[string]interface{}.
+// MapScan scans a single Row into the dest map[string]any.
 // Use this to get results for SQL that might not be under your control
 // (for instance, if you're building an interface for an SQL server that
 // executes SQL from input).  Please do not use this as a primary interface!
 // This will modify the map sent to it in place, so reuse the same map with
 // care.  Columns which occur more than once in the result will overwrite
 // each other!
-func MapScan(r ColScanner, dest map[string]interface{}) error {
+func MapScan(r ColScanner, dest map[string]any) error {
 	// ignore r.started, since we needn't use reflect for anything.
 	columns, err := r.Columns()
 	if err != nil {
 		return err
 	}
 
-	values := make([]interface{}, len(columns))
+	values := make([]any, len(columns))
 	for i := range values {
-		values[i] = new(interface{})
+		values[i] = new(any)
 	}
 
 	err = r.Scan(values...)
@@ -852,7 +941,7 @@ func MapScan(r ColScanner, dest map[string]interface{}) error {
 	}
 
 	for i, column := range columns {
-		dest[column] = *(values[i].(*interface{}))
+		dest[column] = *(values[i].(*any))
 	}
 
 	return r.Err()
@@ -863,14 +952,14 @@ type rowsi interface {
 	Columns() ([]string, error)
 	Err() error
 	Next() bool
-	Scan(...interface{}) error
+	Scan(...any) error
 }
 
 // structOnlyError returns an error appropriate for type when a non-scannable
 // struct is expected but something else is given
 func structOnlyError(t reflect.Type) error {
 	isStruct := t.Kind() == reflect.Struct
-	isScanner := reflect.PtrTo(t).Implements(_scannerInterface)
+	isScanner := reflect.PointerTo(t).Implements(_scannerInterface)
 	if !isStruct {
 		return fmt.Errorf("expected %s but got %s", reflect.Struct, t.Kind())
 	}
@@ -896,13 +985,11 @@ func structOnlyError(t reflect.Type) error {
 // to `Get` and `Select`.  The reason that this has been implemented like this is
 // this is the only way to not duplicate reflect work in the new API while
 // maintaining backwards compatibility.
-func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
-	var v, vp reflect.Value
-
+func scanAll(rows rowsi, dest any, structOnly bool) error {
 	value := reflect.ValueOf(dest)
 
 	// json.Unmarshal returns errors for these
-	if value.Kind() != reflect.Ptr {
+	if value.Kind() != reflect.Pointer {
 		return errors.New("must pass a pointer, not a value, to StructScan destination")
 	}
 	if value.IsNil() {
@@ -914,9 +1001,14 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 	if err != nil {
 		return err
 	}
+	// Elements from a previous call may still be present in the backing
+	// array.  The old implementation allocated a fresh zero struct for every
+	// row, so zero reused elements as they are overwritten to avoid leaking
+	// values for columns that the current query does not select.
+	oldLen := direct.Len()
 	direct.SetLen(0)
 
-	isPtr := slice.Elem().Kind() == reflect.Ptr
+	isPtr := slice.Elem().Kind() == reflect.Pointer
 	base := reflectx.Deref(slice.Elem())
 	scannable := isScannable(base)
 
@@ -934,62 +1026,195 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 		return fmt.Errorf("non-struct dest type %s with >1 columns (%d)", base.Kind(), len(columns))
 	}
 
-	if !scannable {
-		var values []interface{}
-		var m *reflectx.Mapper
-
-		switch rows := rows.(type) {
-		case *Rows:
-			m = rows.Mapper
-		default:
-			m = mapper()
-		}
-
-		fields := m.TraversalsByName(base, columns)
-		// if we are not unsafe and are missing fields, return an error
-		if f, err := missingFields(fields); err != nil && !isUnsafe(rows) {
-			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
-		}
-		values = make([]interface{}, len(columns))
-
-		for rows.Next() {
-			// create a new struct type (which returns PtrTo) and indirect it
-			vp = reflect.New(base)
-			v = reflect.Indirect(vp)
-
-			err = fieldsByTraversal(v, fields, values, true)
-			if err != nil {
-				return err
-			}
-
-			// scan into the struct field pointers and append to our results
-			err = rows.Scan(values...)
-			if err != nil {
-				return err
-			}
-
-			if isPtr {
-				direct.Set(reflect.Append(direct, vp))
-			} else {
-				direct.Set(reflect.Append(direct, v))
-			}
-		}
-	} else {
-		for rows.Next() {
-			vp = reflect.New(base)
-			err = rows.Scan(vp.Interface())
-			if err != nil {
-				return err
-			}
-			// append
-			if isPtr {
-				direct.Set(reflect.Append(direct, vp))
-			} else {
-				direct.Set(reflect.Append(direct, reflect.Indirect(vp)))
-			}
-		}
+	if scannable {
+		return scanAllScalar(rows, direct, base, isPtr, oldLen)
 	}
 
+	// Generated or hand-written RowScanner implementations skip the
+	// column-to-field planning entirely.
+	if raw := rawSQLRows(rows); raw != nil && reflect.PointerTo(base).Implements(_rowScannerType) {
+		return scanAllScanner(rows, raw, direct, base, isPtr, oldLen)
+	}
+
+	var m *reflectx.Mapper
+
+	switch rows := rows.(type) {
+	case *Rows:
+		m = rows.Mapper
+	default:
+		m = mapper()
+	}
+
+	fields := m.FieldInfosByName(base, columns)
+	// if we are not unsafe and are missing fields, return an error
+	if f, err := missingFields(fields); err != nil && !isUnsafe(rows) {
+		return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
+	}
+	values := make([]any, len(columns))
+
+	if isPtr {
+		sliceType := reflect.SliceOf(base)
+		var block reflect.Value
+		blockIdx := ptrBlockSize
+		n := 0
+		for rows.Next() {
+			if blockIdx == ptrBlockSize {
+				block = reflect.MakeSlice(sliceType, ptrBlockSize, ptrBlockSize)
+				blockIdx = 0
+			}
+			elem := block.Index(blockIdx)
+			blockIdx++
+			if err := fieldPointers(elem, fields, values); err != nil {
+				return err
+			}
+			if err := rows.Scan(values...); err != nil {
+				return err
+			}
+			n++
+			growSlice(direct, n)
+			direct.Index(n - 1).Set(elem.Addr())
+		}
+		direct.SetLen(n)
+		return rows.Err()
+	}
+
+	// Use one scratch struct per query: field addresses are resolved once,
+	// then each row is Scan + a direct reflect Set into the destination slice.
+	// Fields reached through an embedded pointer cannot use this path because
+	// zeroing the scratch would invalidate their cached addresses.
+	if !needsPerRowPointers(fields) {
+		scratch := reflect.New(base)
+		if err := fieldPointers(scratch, fields, values); err != nil {
+			return err
+		}
+
+		n := 0
+		for rows.Next() {
+			n++
+			growSlice(direct, n)
+			scratch.Elem().SetZero()
+			if err := rows.Scan(values...); err != nil {
+				direct.SetLen(n - 1)
+				return err
+			}
+			direct.Index(n - 1).Set(scratch.Elem())
+		}
+		direct.SetLen(n)
+
+		return rows.Err()
+	}
+
+	// Fallback for indirection: scan directly into a fresh slice element and
+	// rebuild its field pointers per row.
+	n := 0
+	for rows.Next() {
+		n++
+		growSlice(direct, n)
+		idx := n - 1
+		if idx < oldLen {
+			direct.Index(idx).SetZero()
+		}
+		if err := fieldPointers(direct.Index(idx), fields, values); err != nil {
+			direct.SetLen(idx)
+			return err
+		}
+		if err := rows.Scan(values...); err != nil {
+			direct.SetLen(idx)
+			return err
+		}
+	}
+	direct.SetLen(n)
+
+	return rows.Err()
+}
+
+// rawSQLRows exposes the underlying *sql.Rows when possible, so generated
+// RowScanner implementations can be used from the generic rowsi entry points.
+func rawSQLRows(rows rowsi) *sql.Rows {
+	switch r := rows.(type) {
+	case *Rows:
+		return r.Rows
+	case *sql.Rows:
+		return r
+	}
+	return nil
+}
+
+// scanAllScanner scans rows using a generated/implemented RowScanner, without
+// touching the mapper or reflect field plans.
+func scanAllScanner(rows rowsi, raw *sql.Rows, direct reflect.Value, base reflect.Type, isPtr bool, oldLen int) error {
+	if isPtr {
+		sliceType := reflect.SliceOf(base)
+		var block reflect.Value
+		blockIdx := ptrBlockSize
+		n := 0
+		for rows.Next() {
+			if blockIdx == ptrBlockSize {
+				block = reflect.MakeSlice(sliceType, ptrBlockSize, ptrBlockSize)
+				blockIdx = 0
+			}
+			ptr := block.Index(blockIdx).Addr()
+			blockIdx++
+			if err := ptr.Interface().(RowScanner).ScanRow(raw); err != nil {
+				return err
+			}
+			n++
+			growSlice(direct, n)
+			direct.Index(n - 1).Set(ptr)
+		}
+		direct.SetLen(n)
+		return rows.Err()
+	}
+
+	scratch := reflect.New(base)
+	scanner, ok := scratch.Interface().(RowScanner)
+	if !ok {
+		return fmt.Errorf("type %s does not implement RowScanner", base)
+	}
+
+	n := 0
+	for rows.Next() {
+		n++
+		growSlice(direct, n)
+		scratch.Elem().SetZero()
+		if err := scanner.ScanRow(raw); err != nil {
+			direct.SetLen(n - 1)
+			return err
+		}
+		direct.Index(n - 1).Set(scratch.Elem())
+	}
+	direct.SetLen(n)
+	return rows.Err()
+}
+
+// scanAllScalar scans single-column rows into a destination slice of a
+// scannable type, filling the slice in place for non-pointer element types.
+func scanAllScalar(rows rowsi, direct reflect.Value, base reflect.Type, isPtr bool, oldLen int) error {
+	if isPtr {
+		for rows.Next() {
+			vp := reflect.New(base)
+			if err := rows.Scan(vp.Interface()); err != nil {
+				return err
+			}
+			direct.Set(reflect.Append(direct, vp))
+		}
+		return rows.Err()
+	}
+
+	n := 0
+	for rows.Next() {
+		n++
+		growSlice(direct, n)
+		idx := n - 1
+		if idx < oldLen {
+			direct.Index(idx).SetZero()
+		}
+		if err := rows.Scan(direct.Index(idx).Addr().Interface()); err != nil {
+			direct.SetLen(idx)
+			return err
+		}
+	}
+	direct.SetLen(n)
 	return rows.Err()
 }
 
@@ -1002,7 +1227,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 // StructScan will scan in the entire rows result, so if you do not want to
 // allocate structs for the entire result, use Queryx and see sqlx.Rows.StructScan.
 // If rows is sqlx.Rows, it will use its mapper, otherwise it will use the default.
-func StructScan(rows rowsi, dest interface{}) error {
+func StructScan(rows rowsi, dest any) error {
 	return scanAll(rows, dest, true)
 
 }
@@ -1017,36 +1242,114 @@ func baseType(t reflect.Type, expected reflect.Kind) (reflect.Type, error) {
 	return t, nil
 }
 
-// fieldsByName fills a values interface with fields from the passed value based
-// on the traversals in int.  If ptrs is true, return addresses instead of values.
-// We write this instead of using FieldsByName to save allocations and map lookups
-// when iterating over many rows.  Empty traversals will get an interface pointer.
-// Because of the necessity of requesting ptrs or values, it's considered a bit too
-// specialized for inclusion in reflectx itself.
-func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}, ptrs bool) error {
+// ptrBlockSize is the number of structs allocated per block when scanning into
+// a slice of pointers.  Each block is one heap allocation, so scanning N rows
+// costs N/ptrBlockSize allocations instead of N.
+const ptrBlockSize = 64
+
+// fieldPointers fills values with pointers to the struct fields described by
+// fields, based on the struct value v.  Empty field infos (missing columns) get
+// a reusable any sink and are not reported as errors here.
+//
+// When the destination is addressable (always true for values reached from a
+// pointer or for slice elements) and the cached field offset is direct, the
+// pointer is computed with a single unsafe.Add instead of replaying the reflect
+// traversal for every row.  Fields behind embedded pointers fall back to the
+// fully allocating reflectx implementation.
+func fieldPointers(v reflect.Value, fields []*reflectx.FieldInfo, values []any) error {
 	v = reflect.Indirect(v)
 	if v.Kind() != reflect.Struct {
 		return errors.New("argument not a struct")
 	}
 
-	for i, traversal := range traversals {
-		if len(traversal) == 0 {
-			values[i] = new(interface{})
+	if !v.CanAddr() {
+		return fieldPointersReflect(v, fields, values)
+	}
+
+	base := unsafe.Pointer(v.UnsafeAddr())
+	for i, fi := range fields {
+		if fi == nil {
+			if values[i] == nil {
+				values[i] = new(any)
+			}
 			continue
 		}
-		f := reflectx.FieldByIndexes(v, traversal)
-		if ptrs {
-			values[i] = f.Addr().Interface()
-		} else {
-			values[i] = f.Interface()
+		if !fi.Direct {
+			values[i] = reflectx.FieldByIndexes(v, fi.Index).Addr().Interface()
+			continue
 		}
+		ft := fi.Field.Type
+		addr := unsafe.Add(base, fi.Offset)
+		// reflectx.FieldByIndexes allocated nil maps before returning the
+		// field, and value-receiver Scanner implementations (a common pattern
+		// for map types) depend on that: they receive a copy of the map header,
+		// so a nil field would stay nil.  Preserve that behavior here.
+		if ft.Kind() == reflect.Map {
+			pv := reflect.NewAt(ft, addr)
+			if pv.Elem().IsNil() {
+				pv.Elem().Set(reflect.MakeMap(ft))
+			}
+			values[i] = pv.Interface()
+			continue
+		}
+		values[i] = reflect.NewAt(ft, addr).Interface()
 	}
 	return nil
 }
 
-func missingFields(transversals [][]int) (field int, err error) {
-	for i, t := range transversals {
-		if len(t) == 0 {
+// needsPerRowPointers reports whether any planned field needs its address (and
+// allocation) rebuilt after the destination is zeroed.  Embedded pointer
+// traversals fall in this category, as do map fields: fieldPointers allocates a
+// nil map before scanning because value-receiver Scanner implementations would
+// otherwise keep a copy of the nil map.
+func needsPerRowPointers(fields []*reflectx.FieldInfo) bool {
+	for _, fi := range fields {
+		if fi == nil {
+			continue
+		}
+		if !fi.Direct || fi.Field.Type.Kind() == reflect.Map {
+			return true
+		}
+	}
+	return false
+}
+
+func fieldPointersReflect(v reflect.Value, fields []*reflectx.FieldInfo, values []any) error {
+	for i, fi := range fields {
+		if fi == nil {
+			if values[i] == nil {
+				values[i] = new(any)
+			}
+			continue
+		}
+		values[i] = reflectx.FieldByIndexes(v, fi.Index).Addr().Interface()
+	}
+	return nil
+}
+
+// growSlice grows s to length n, preserving its contents.  Unlike
+// reflect.Append it does not need a value for the new element; callers scan
+// directly into the element afterwards.  Capacity grows like append: by
+// doubling (with a small minimum to avoid repeated early growth).
+func growSlice(s reflect.Value, n int) {
+	if s.Cap() < n {
+		newCap := s.Cap() * 2
+		if newCap < n || newCap < s.Cap() { // overflow or still too small
+			newCap = n
+		}
+		if newCap < 8 {
+			newCap = 8
+		}
+		ns := reflect.MakeSlice(s.Type(), s.Len(), newCap)
+		reflect.Copy(ns, s)
+		s.Set(ns)
+	}
+	s.SetLen(n)
+}
+
+func missingFields(fields []*reflectx.FieldInfo) (field int, err error) {
+	for i, fi := range fields {
+		if fi == nil {
 			return i, errors.New("missing field")
 		}
 	}

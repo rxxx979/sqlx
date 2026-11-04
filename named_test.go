@@ -53,20 +53,20 @@ func TestCompileQuery(t *testing.T) {
 			T: `SELECT @name := "name", @p1, @p2, @p3`,
 			V: []string{"age", "first", "last"},
 		},
-		/* This unicode awareness test sadly fails, because of our byte-wise worldview.
-		 * We could certainly iterate by Rune instead, though it's a great deal slower,
-		 * it's probably the RightWay(tm)
 		{
+			// Named parameters may contain non-ASCII letters; the scanner
+			// advances by rune rather than by byte.
 			Q: `INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
 			R: `INSERT INTO foo (a,b,c,d) VALUES (?, ?, ?, ?)`,
 			D: `INSERT INTO foo (a,b,c,d) VALUES ($1, $2, $3, $4)`,
-			N: []string{"name", "age", "first", "last"},
+			T: `INSERT INTO foo (a,b,c,d) VALUES (@p1, @p2, @p3, @p4)`,
+			N: `INSERT INTO foo (a,b,c,d) VALUES (:あ, :b, :キコ, :名前)`,
+			V: []string{"あ", "b", "キコ", "名前"},
 		},
-		*/
 	}
 
 	for _, test := range table {
-		qr, names, err := compileNamedQuery([]byte(test.Q), QUESTION)
+		qr, names, err := compileNamedQuery(test.Q, QUESTION)
 		if err != nil {
 			t.Error(err)
 		}
@@ -82,17 +82,17 @@ func TestCompileQuery(t *testing.T) {
 				}
 			}
 		}
-		qd, _, _ := compileNamedQuery([]byte(test.Q), DOLLAR)
+		qd, _, _ := compileNamedQuery(test.Q, DOLLAR)
 		if qd != test.D {
 			t.Errorf("\nexpected: `%s`\ngot:      `%s`", test.D, qd)
 		}
 
-		qt, _, _ := compileNamedQuery([]byte(test.Q), AT)
+		qt, _, _ := compileNamedQuery(test.Q, AT)
 		if qt != test.T {
 			t.Errorf("\nexpected: `%s`\ngot:      `%s`", test.T, qt)
 		}
 
-		qq, _, _ := compileNamedQuery([]byte(test.Q), NAMED)
+		qq, _, _ := compileNamedQuery(test.Q, NAMED)
 		if qq != test.N {
 			t.Errorf("\nexpected: `%s`\ngot:      `%s`\n(len: %d vs %d)", test.N, qq, len(test.N), len(qq))
 		}
@@ -103,7 +103,7 @@ type Test struct {
 	t *testing.T
 }
 
-func (t Test) Error(err error, msg ...interface{}) {
+func (t Test) Error(err error, msg ...any) {
 	t.t.Helper()
 	if err != nil {
 		if len(msg) == 0 {
@@ -114,7 +114,7 @@ func (t Test) Error(err error, msg ...interface{}) {
 	}
 }
 
-func (t Test) Errorf(err error, format string, args ...interface{}) {
+func (t Test) Errorf(err error, format string, args ...any) {
 	t.t.Helper()
 	if err != nil {
 		t.t.Errorf(format, args...)
@@ -125,7 +125,7 @@ func TestEscapedColons(t *testing.T) {
 	t.Skip("not sure it is possible to support this in general case without an SQL parser")
 	var qs = `SELECT * FROM testtable WHERE timeposted BETWEEN (now() AT TIME ZONE 'utc') AND
 	(now() AT TIME ZONE 'utc') - interval '01:30:00') AND name = '\'this is a test\'' and id = :id`
-	_, _, err := compileNamedQuery([]byte(qs), DOLLAR)
+	_, _, err := compileNamedQuery(qs, DOLLAR)
 	if err != nil {
 		t.Error("Didn't handle colons correctly when inside a string")
 	}
@@ -212,7 +212,7 @@ func TestNamedQueries(t *testing.T) {
 		test.Error(err)
 
 		// test map batch inserts
-		slsMap := []map[string]interface{}{
+		slsMap := []map[string]any{
 			{"first_name": "Ardie", "last_name": "Savea", "email": "asavea@ab.co.nz"},
 			{"first_name": "Sonny Bill", "last_name": "Williams", "email": "sbw@ab.co.nz"},
 			{"first_name": "Ngani", "last_name": "Laumape", "email": "nlaumape@ab.co.nz"},
@@ -222,7 +222,7 @@ func TestNamedQueries(t *testing.T) {
 			VALUES (:first_name, :last_name, :email) ;--`, slsMap)
 		test.Error(err)
 
-		type A map[string]interface{}
+		type A map[string]any
 
 		typedMap := []A{
 			{"first_name": "Ardie", "last_name": "Savea", "email": "asavea@ab.co.nz"},

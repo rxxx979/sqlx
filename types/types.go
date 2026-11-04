@@ -6,7 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 )
 
 // GzippedText is a []byte which transparently gzips data being submitted to
@@ -16,18 +16,20 @@ type GzippedText []byte
 // Value implements the driver.Valuer interface, gzipping the raw value of
 // this GzippedText.
 func (g GzippedText) Value() (driver.Value, error) {
-	b := make([]byte, 0, len(g))
-	buf := bytes.NewBuffer(b)
-	w := gzip.NewWriter(buf)
-	w.Write(g)
-	w.Close()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(g); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
 	return buf.Bytes(), nil
-
 }
 
 // Scan implements the sql.Scanner interface, ungzipping the value coming off
 // the wire and storing the raw result in the GzippedText.
-func (g *GzippedText) Scan(src interface{}) error {
+func (g *GzippedText) Scan(src any) error {
 	var source []byte
 	switch src := src.(type) {
 	case string:
@@ -43,7 +45,7 @@ func (g *GzippedText) Scan(src interface{}) error {
 		return err
 	}
 	defer reader.Close()
-	b, err := ioutil.ReadAll(reader)
+	b, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
@@ -54,7 +56,7 @@ func (g *GzippedText) Scan(src interface{}) error {
 // JSONText is a json.RawMessage, which is a []byte underneath.
 // Value() validates the json format in the source, and returns an error if
 // the json is not valid.  Scan does no validation.  JSONText additionally
-// implements `Unmarshal`, which unmarshals the json within to an interface{}
+// implements `Unmarshal`, which unmarshals the json within into any value
 type JSONText json.RawMessage
 
 var emptyJSON = JSONText("{}")
@@ -88,7 +90,7 @@ func (j JSONText) Value() (driver.Value, error) {
 }
 
 // Scan stores the src in *j.  No validation is done.
-func (j *JSONText) Scan(src interface{}) error {
+func (j *JSONText) Scan(src any) error {
 	var source []byte
 	switch t := src.(type) {
 	case string:
@@ -110,7 +112,7 @@ func (j *JSONText) Scan(src interface{}) error {
 }
 
 // Unmarshal unmarshal's the json in j to v, as in json.Unmarshal.
-func (j *JSONText) Unmarshal(v interface{}) error {
+func (j *JSONText) Unmarshal(v any) error {
 	if len(*j) == 0 {
 		*j = emptyJSON
 	}
@@ -131,7 +133,7 @@ type NullJSONText struct {
 }
 
 // Scan implements the Scanner interface.
-func (n *NullJSONText) Scan(value interface{}) error {
+func (n *NullJSONText) Scan(value any) error {
 	if value == nil {
 		n.JSONText, n.Valid = emptyJSON, false
 		return nil
@@ -163,7 +165,7 @@ func (b BitBool) Value() (driver.Value, error) {
 
 // Scan implements the sql.Scanner interface,
 // and turns the bitfield incoming from MySQL into a BitBool
-func (b *BitBool) Scan(src interface{}) error {
+func (b *BitBool) Scan(src any) error {
 	v, ok := src.([]byte)
 	if !ok {
 		return errors.New("bad []byte type assertion")

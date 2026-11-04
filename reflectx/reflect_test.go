@@ -53,10 +53,10 @@ func TestBasicEmbedded(t *testing.T) {
 
 	m := NewMapperFunc("db", func(s string) string { return s })
 
-	z := Baz{}
-	z.A = 1
-	z.B = 2
-	z.C = 4
+	z := Baz{
+		A: 1,
+		B: 2,
+		C: 4}
 	z.Bar.Foo.A = 3
 
 	zv := reflect.ValueOf(z)
@@ -124,9 +124,9 @@ func TestBasicEmbeddedWithTags(t *testing.T) {
 
 	m := NewMapper("db")
 
-	z := Baz{}
-	z.A = 1
-	z.B = 2
+	z := Baz{
+		A: 1,
+		B: 2}
 	z.Bar.Foo.A = 3
 
 	zv := reflect.ValueOf(z)
@@ -163,9 +163,9 @@ func TestBasicEmbeddedWithSameName(t *testing.T) {
 
 	m := NewMapper("db")
 
-	z := FooExt{}
-	z.A = 1
-	z.B = 2
+	z := FooExt{
+		A: 1,
+		B: 2}
 	z.Foo.Foo = 3
 
 	zv := reflect.ValueOf(z)
@@ -232,7 +232,7 @@ func TestNestedStruct(t *testing.T) {
 
 	post := Post{
 		Author: "Joe",
-		Asset:  Asset{Title: "Hello", Details: Details{Active: true}},
+		Title:  "Hello", Details: Details{Active: true},
 	}
 	pv := reflect.ValueOf(post)
 
@@ -605,7 +605,7 @@ func TestGetByTraversal(t *testing.T) {
 	}
 
 	m := NewMapperFunc("db", func(n string) string { return n })
-	tm := m.TypeMap(reflect.TypeOf(A{}))
+	tm := m.TypeMap(reflect.TypeFor[A]())
 
 	for i, tc := range testCases {
 		fi := tm.GetByTraversal(tc.Index)
@@ -650,18 +650,16 @@ func TestMapperMethodsByName(t *testing.T) {
 			B1: C{C0: "2", C1: 3},
 			B2: "4",
 		},
-		B: B{
-			B0: nil,
-			B1: C{C0: "5", C1: 6},
-			B2: "7",
-		},
+		B0: nil,
+		B1: C{C0: "5", C1: 6},
+		B2: "7",
 		A2: 8,
 	}
 
 	testCases := []struct {
 		Name            string
 		ExpectInvalid   bool
-		ExpectedValue   interface{}
+		ExpectedValue   any
 		ExpectedIndexes []int
 	}{
 		{
@@ -789,9 +787,9 @@ func TestFieldByIndexes(t *testing.T) {
 		A2 *B
 	}
 	testCases := []struct {
-		value         interface{}
+		value         any
 		indexes       []int
-		expectedValue interface{}
+		expectedValue any
 		readOnly      bool
 	}{
 		{
@@ -838,7 +836,7 @@ func TestFieldByIndexes(t *testing.T) {
 }
 
 func TestMustBe(t *testing.T) {
-	typ := reflect.TypeOf(E1{})
+	typ := reflect.TypeFor[E1]()
 	mustBe(typ, reflect.Struct)
 
 	defer func() {
@@ -848,7 +846,7 @@ func TestMustBe(t *testing.T) {
 				t.Errorf("unexpected Method: %s", valueErr.Method)
 				t.Fatal("expected panic with *reflect.ValueError")
 			}
-			if valueErr.Method != "github.com/jmoiron/sqlx/reflectx.TestMustBe" {
+			if valueErr.Method != "github.com/rxxx979/sqlx/reflectx.TestMustBe" {
 				t.Fatalf("unexpected Method: %s", valueErr.Method)
 			}
 			if valueErr.Kind != reflect.String {
@@ -859,7 +857,7 @@ func TestMustBe(t *testing.T) {
 		}
 	}()
 
-	typ = reflect.TypeOf("string")
+	typ = reflect.TypeFor[string]()
 	mustBe(typ, reflect.Struct)
 	t.Fatal("got here, didn't expect to")
 }
@@ -892,8 +890,7 @@ func BenchmarkFieldNameL1(b *testing.B) {
 }
 
 func BenchmarkFieldNameL4(b *testing.B) {
-	e4 := E4{}
-	e4.A = 1
+	e4 := E4{A: 1}
 	for i := 0; i < b.N; i++ {
 		v := reflect.ValueOf(e4)
 		f := v.FieldByName("A")
@@ -915,8 +912,7 @@ func BenchmarkFieldPosL1(b *testing.B) {
 }
 
 func BenchmarkFieldPosL4(b *testing.B) {
-	e4 := E4{}
-	e4.A = 1
+	e4 := E4{A: 1}
 	for i := 0; i < b.N; i++ {
 		v := reflect.ValueOf(e4)
 		f := v.Field(0)
@@ -930,8 +926,7 @@ func BenchmarkFieldPosL4(b *testing.B) {
 }
 
 func BenchmarkFieldByIndexL4(b *testing.B) {
-	e4 := E4{}
-	e4.A = 1
+	e4 := E4{A: 1}
 	idx := []int{0, 0, 0, 0}
 	for i := 0; i < b.N; i++ {
 		v := reflect.ValueOf(e4)
@@ -960,7 +955,7 @@ func BenchmarkTraversalsByName(b *testing.B) {
 	}
 
 	m := NewMapper("")
-	t := reflect.TypeOf(D{})
+	t := reflect.TypeFor[D]()
 	names := []string{"C", "B", "A", "Value"}
 
 	b.ResetTimer()
@@ -990,7 +985,7 @@ func BenchmarkTraversalsByNameFunc(b *testing.B) {
 	}
 
 	m := NewMapper("")
-	t := reflect.TypeOf(D{})
+	t := reflect.TypeFor[D]()
 	names := []string{"C", "B", "A", "Z", "Y"}
 
 	b.ResetTimer()

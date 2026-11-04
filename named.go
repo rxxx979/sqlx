@@ -12,16 +12,19 @@ package sqlx
 //  * bindArgs, bindMapArgs, bindAnyArgs - given a list of names, return an arglist
 //
 import (
-	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
-	"regexp"
+	"slices"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
+	"unicode/utf8"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/rxxx979/sqlx/reflectx"
 )
 
 // NamedStmt is a prepared statement that executes named queries.  Prepare it
@@ -39,7 +42,7 @@ func (n *NamedStmt) Close() error {
 
 // Exec executes a named statement using the struct passed.
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) Exec(arg interface{}) (sql.Result, error) {
+func (n *NamedStmt) Exec(arg any) (sql.Result, error) {
 	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
 	if err != nil {
 		return *new(sql.Result), err
@@ -49,7 +52,7 @@ func (n *NamedStmt) Exec(arg interface{}) (sql.Result, error) {
 
 // Query executes a named statement using the struct argument, returning rows.
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) Query(arg interface{}) (*sql.Rows, error) {
+func (n *NamedStmt) Query(arg any) (*sql.Rows, error) {
 	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
 	if err != nil {
 		return nil, err
@@ -61,7 +64,7 @@ func (n *NamedStmt) Query(arg interface{}) (*sql.Rows, error) {
 // create a *sql.Row with an error condition pre-set for binding errors, sqlx
 // returns a *sqlx.Row instead.
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) QueryRow(arg interface{}) *Row {
+func (n *NamedStmt) QueryRow(arg any) *Row {
 	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
 	if err != nil {
 		return &Row{err: err}
@@ -71,7 +74,7 @@ func (n *NamedStmt) QueryRow(arg interface{}) *Row {
 
 // MustExec execs a NamedStmt, panicing on error
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) MustExec(arg interface{}) sql.Result {
+func (n *NamedStmt) MustExec(arg any) sql.Result {
 	res, err := n.Exec(arg)
 	if err != nil {
 		panic(err)
@@ -81,7 +84,7 @@ func (n *NamedStmt) MustExec(arg interface{}) sql.Result {
 
 // Queryx using this NamedStmt
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) Queryx(arg interface{}) (*Rows, error) {
+func (n *NamedStmt) Queryx(arg any) (*Rows, error) {
 	r, err := n.Query(arg)
 	if err != nil {
 		return nil, err
@@ -92,13 +95,13 @@ func (n *NamedStmt) Queryx(arg interface{}) (*Rows, error) {
 // QueryRowx this NamedStmt.  Because of limitations with QueryRow, this is
 // an alias for QueryRow.
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) QueryRowx(arg interface{}) *Row {
+func (n *NamedStmt) QueryRowx(arg any) *Row {
 	return n.QueryRow(arg)
 }
 
 // Select using this NamedStmt
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) Select(dest interface{}, arg interface{}) error {
+func (n *NamedStmt) Select(dest any, arg any) error {
 	rows, err := n.Queryx(arg)
 	if err != nil {
 		return err
@@ -110,7 +113,7 @@ func (n *NamedStmt) Select(dest interface{}, arg interface{}) error {
 
 // Get using this NamedStmt
 // Any named placeholder parameters are replaced with fields from arg.
-func (n *NamedStmt) Get(dest interface{}, arg interface{}) error {
+func (n *NamedStmt) Get(dest any, arg any) error {
 	r := n.QueryRowx(arg)
 	return r.scanAny(dest, false)
 }
@@ -131,7 +134,7 @@ type namedPreparer interface {
 
 func prepareNamed(p namedPreparer, query string) (*NamedStmt, error) {
 	bindType := BindType(p.DriverName())
-	q, args, err := compileNamedQuery([]byte(query), bindType)
+	q, args, err := compileNamedQueryCached(query, bindType)
 	if err != nil {
 		return nil, err
 	}
@@ -141,68 +144,106 @@ func prepareNamed(p namedPreparer, query string) (*NamedStmt, error) {
 	}
 	return &NamedStmt{
 		QueryString: q,
-		Params:      args,
+		Params:      slices.Clone(args),
 		Stmt:        stmt,
 	}, nil
 }
 
-// convertMapStringInterface attempts to convert v to map[string]interface{}.
-// Unlike v.(map[string]interface{}), this function works on named types that
-// are convertible to map[string]interface{} as well.
-func convertMapStringInterface(v interface{}) (map[string]interface{}, bool) {
-	var m map[string]interface{}
-	mtype := reflect.TypeOf(m)
-	t := reflect.TypeOf(v)
-	if !t.ConvertibleTo(mtype) {
+// mapStringInterfaceType is the canonical type used to normalize named map
+// arguments.  Caching it avoids a reflect.TypeFor lookup on the hot path.
+var mapStringInterfaceType = reflect.TypeFor[map[string]any]()
+
+// convertMapStringInterface attempts to convert v to map[string]any.
+// Unlike v.(map[string]any), this function works on named types that
+// are convertible to map[string]any as well.
+func convertMapStringInterface(v any) (map[string]any, bool) {
+	if m, ok := v.(map[string]any); ok {
+		return m, true
+	}
+	if v == nil {
 		return nil, false
 	}
-	return reflect.ValueOf(v).Convert(mtype).Interface().(map[string]interface{}), true
-
+	t := reflect.TypeOf(v)
+	if !t.ConvertibleTo(mapStringInterfaceType) {
+		return nil, false
+	}
+	return reflect.ValueOf(v).Convert(mapStringInterfaceType).Interface().(map[string]any), true
 }
 
-func bindAnyArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{}, error) {
-	if maparg, ok := convertMapStringInterface(arg); ok {
-		return bindMapArgs(names, maparg)
+func bindAnyArgs(names []string, arg any, m *reflectx.Mapper) ([]any, error) {
+	// A generated or hand-written StructBinder bypasses reflection entirely.
+	if b, ok := arg.(StructBinder); ok {
+		if rv := reflect.ValueOf(arg); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return nil, fmt.Errorf("nil pointer passed as named query argument: %#v", arg)
+		}
+		return b.BindArgs(names)
+	}
+	switch arg := arg.(type) {
+	case map[string]any:
+		return bindMapArgs(names, arg)
+	case nil:
+		return nil, errors.New("sqlx: nil argument passed to named query")
+	}
+	// Only map arguments need the convertibility check; structs (by far the
+	// most common case) go straight to the field plan.
+	if t := reflect.TypeOf(arg); t.Kind() == reflect.Map {
+		if maparg, ok := convertMapStringInterface(arg); ok {
+			return bindMapArgs(names, maparg)
+		}
+		return nil, fmt.Errorf("sqlx: unsupported map type: %T", arg)
 	}
 	return bindArgs(names, arg, m)
 }
 
-// private interface to generate a list of interfaces from a given struct
-// type, given a list of names to pull out of the struct.  Used by public
-// BindStruct interface.
-func bindArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{}, error) {
-	arglist := make([]interface{}, 0, len(names))
-
+// bindArgs generates a list of interfaces from a struct argument, given a list
+// of names to pull out of the struct.  Used by the public BindStruct interface.
+//
+// Field lookups use the mapper's cached column-to-field plans, so repeated
+// executions against the same type do not rebuild traversals.
+func bindArgs(names []string, arg any, m *reflectx.Mapper) ([]any, error) {
 	// grab the indirected value of arg
-	var v reflect.Value
-	for v = reflect.ValueOf(arg); v.Kind() == reflect.Ptr; {
+	v := reflect.ValueOf(arg)
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil, fmt.Errorf("nil pointer passed as named query argument: %#v", arg)
+		}
 		v = v.Elem()
 	}
+	if v.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("expected a struct or map argument, got %T", arg)
+	}
 
-	err := m.TraversalsByNameFunc(v.Type(), names, func(i int, t []int) error {
-		if len(t) == 0 {
-			return fmt.Errorf("could not find name %s in %#v", names[i], arg)
+	fields := m.FieldInfosByName(v.Type(), names)
+	return appendStructArgs(make([]any, 0, len(names)), v, fields, names, arg)
+}
+
+// appendStructArgs appends the values of fields to dst.  v must be a struct;
+// fields must have been resolved from v's type and names.  When the struct is
+// addressable (slice elements, pointers) the cached field offsets are used
+// instead of replaying the reflect traversal.
+func appendStructArgs(dst []any, v reflect.Value, fields []*reflectx.FieldInfo, names []string, arg any) ([]any, error) {
+	for i, fi := range fields {
+		if fi == nil {
+			return dst, fmt.Errorf("could not find name %s in %#v", names[i], arg)
 		}
-
-		val := reflectx.FieldByIndexesReadOnly(v, t)
-		arglist = append(arglist, val.Interface())
-
-		return nil
-	})
-
-	return arglist, err
+		// FieldByIndex is the fastest way to read a value out of an
+		// addressable struct with a precomputed index path; NewAt+Elem is
+		// measurably slower here because reading does not need an address.
+		dst = append(dst, v.FieldByIndex(fi.Index).Interface())
+	}
+	return dst, nil
 }
 
 // like bindArgs, but for maps.
-func bindMapArgs(names []string, arg map[string]interface{}) ([]interface{}, error) {
-	arglist := make([]interface{}, 0, len(names))
+func bindMapArgs(names []string, arg map[string]any) ([]any, error) {
+	arglist := make([]any, len(names))
 
-	for _, name := range names {
+	for i, name := range names {
 		val, ok := arg[name]
 		if !ok {
 			return arglist, fmt.Errorf("could not find name %s in %#v", name, arg)
 		}
-		arglist = append(arglist, val)
+		arglist[i] = val
 	}
 	return arglist, nil
 }
@@ -210,29 +251,27 @@ func bindMapArgs(names []string, arg map[string]interface{}) ([]interface{}, err
 // bindStruct binds a named parameter query with fields from a struct argument.
 // The rules for binding field names to parameter names follow the same
 // conventions as for StructScan, including obeying the `db` struct tags.
-func bindStruct(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
-	bound, names, err := compileNamedQuery([]byte(query), bindType)
+func bindStruct(bindType int, query string, arg any, m *reflectx.Mapper) (string, []any, error) {
+	bound, names, err := compileNamedQueryCached(query, bindType)
 	if err != nil {
-		return "", []interface{}{}, err
+		return "", []any{}, err
 	}
 
 	arglist, err := bindAnyArgs(names, arg, m)
 	if err != nil {
-		return "", []interface{}{}, err
+		return "", []any{}, err
 	}
 
 	return bound, arglist, nil
 }
 
-var valuesReg = regexp.MustCompile(`\)\s*(?i)VALUES\s*\(`)
-
 func findMatchingClosingBracketIndex(s string) int {
 	count := 0
-	for i, ch := range s {
-		if ch == '(' {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
 			count++
-		}
-		if ch == ')' {
+		case ')':
 			count--
 			if count == 0 {
 				return i
@@ -242,14 +281,47 @@ func findMatchingClosingBracketIndex(s string) int {
 	return 0
 }
 
+// findValuesClause locates the "(" in the first `)\s*VALUES\s*(` sequence,
+// case-insensitively.  It replaces a regular expression that used to be run for
+// every bindArray call.
+func findValuesClause(s string) (int, bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != ')' {
+			continue
+		}
+		j := i + 1
+		for j < len(s) && isSpaceByte(s[j]) {
+			j++
+		}
+		if j+len("values") > len(s) || !strings.EqualFold(s[j:j+len("values")], "values") {
+			continue
+		}
+		j += len("values")
+		for j < len(s) && isSpaceByte(s[j]) {
+			j++
+		}
+		if j < len(s) && s[j] == '(' {
+			return j, true
+		}
+	}
+	return 0, false
+}
+
+func isSpaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	}
+	return false
+}
+
 func fixBound(bound string, loop int) string {
-	loc := valuesReg.FindStringIndex(bound)
+	openingBracketIndex, ok := findValuesClause(bound)
 	// defensive guard when "VALUES (...)" not found
-	if len(loc) < 2 {
+	if !ok {
 		return bound
 	}
 
-	openingBracketIndex := loc[1] - 1
 	index := findMatchingClosingBracketIndex(bound[openingBracketIndex:])
 	// defensive guard. must have closing bracket
 	if index == 0 {
@@ -257,11 +329,12 @@ func fixBound(bound string, loop int) string {
 	}
 	closingBracketIndex := openingBracketIndex + index + 1
 
-	var buffer bytes.Buffer
+	var buffer strings.Builder
+	buffer.Grow(len(bound) + (loop-1)*(closingBracketIndex-openingBracketIndex))
 
 	buffer.WriteString(bound[0:closingBracketIndex])
 	for i := 0; i < loop-1; i++ {
-		buffer.WriteString(",")
+		buffer.WriteByte(',')
 		buffer.WriteString(bound[openingBracketIndex:closingBracketIndex])
 	}
 	buffer.WriteString(bound[closingBracketIndex:])
@@ -270,25 +343,51 @@ func fixBound(bound string, loop int) string {
 
 // bindArray binds a named parameter query with fields from an array or slice of
 // structs argument.
-func bindArray(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
+func bindArray(bindType int, query string, arg any, m *reflectx.Mapper) (string, []any, error) {
 	// do the initial binding with QUESTION;  if bindType is not question,
 	// we can rebind it at the end.
-	bound, names, err := compileNamedQuery([]byte(query), QUESTION)
+	bound, names, err := compileNamedQueryCached(query, QUESTION)
 	if err != nil {
-		return "", []interface{}{}, err
+		return "", []any{}, err
 	}
 	arrayValue := reflect.ValueOf(arg)
 	arrayLen := arrayValue.Len()
 	if arrayLen == 0 {
-		return "", []interface{}{}, fmt.Errorf("length of array is 0: %#v", arg)
+		return "", []any{}, fmt.Errorf("length of array is 0: %#v", arg)
 	}
-	var arglist = make([]interface{}, 0, len(names)*arrayLen)
-	for i := 0; i < arrayLen; i++ {
-		elemArglist, err := bindAnyArgs(names, arrayValue.Index(i).Interface(), m)
-		if err != nil {
-			return "", []interface{}{}, err
+	arglist := make([]any, 0, len(names)*arrayLen)
+
+	// Fast path for slices and arrays of structs (or pointers to structs):
+	// resolve the column plan once and reuse it for every element.
+	if elemType := reflectx.Deref(arrayValue.Type().Elem()); elemType.Kind() == reflect.Struct {
+		fields := m.FieldInfosByName(elemType, names)
+		for i, fi := range fields {
+			if fi == nil {
+				return "", []any{}, fmt.Errorf("could not find name %s in %#v", names[i], arg)
+			}
 		}
-		arglist = append(arglist, elemArglist...)
+		for i := range arrayLen {
+			ev := arrayValue.Index(i)
+			for ev.Kind() == reflect.Pointer {
+				if ev.IsNil() {
+					return "", []any{}, fmt.Errorf("nil element at index %d in %#v", i, arg)
+				}
+				ev = ev.Elem()
+			}
+			var err error
+			arglist, err = appendStructArgs(arglist, ev, fields, names, arg)
+			if err != nil {
+				return "", []any{}, err
+			}
+		}
+	} else {
+		for i := range arrayLen {
+			elemArglist, err := bindAnyArgs(names, arrayValue.Index(i).Interface(), m)
+			if err != nil {
+				return "", []any{}, err
+			}
+			arglist = append(arglist, elemArglist...)
+		}
 	}
 	if arrayLen > 1 {
 		bound = fixBound(bound, arrayLen)
@@ -301,10 +400,10 @@ func bindArray(bindType int, query string, arg interface{}, m *reflectx.Mapper) 
 }
 
 // bindMap binds a named parameter query with a map of arguments.
-func bindMap(bindType int, query string, args map[string]interface{}) (string, []interface{}, error) {
-	bound, names, err := compileNamedQuery([]byte(query), bindType)
+func bindMap(bindType int, query string, args map[string]any) (string, []any, error) {
+	bound, names, err := compileNamedQueryCached(query, bindType)
 	if err != nil {
-		return "", []interface{}{}, err
+		return "", []any{}, err
 	}
 
 	arglist, err := bindMapArgs(names, args)
@@ -319,56 +418,126 @@ func bindMap(bindType int, query string, args map[string]interface{}) (string, [
 // digits and numbers, where '5' is a digit but '五' is not.
 var allowedBindRunes = []*unicode.RangeTable{unicode.Letter, unicode.Digit}
 
-// FIXME: this function isn't safe for unicode named params, as a failing test
-// can testify.  This is not a regression but a failure of the original code
-// as well.  It should be modified to range over runes in a string rather than
-// bytes, even though this is less convenient and slower.  Hopefully the
-// addition of the prepared NamedStmt (which will only do this once) will make
-// up for the slightly slower ad-hoc NamedExec/NamedQuery.
+// compiledNamedQuery is an immutable compilation result, safe to share between
+// goroutines.
+type compiledNamedQuery struct {
+	query string
+	names []string
+}
+
+type compiledNamedQueryKey struct {
+	query    string
+	bindType int
+}
+
+var (
+	// namedQueryCache memoizes the (pure) named-query compiler.  Ad-hoc
+	// NamedExec/NamedQuery calls with the same SQL text (the overwhelmingly
+	// common case) then pay only the binding cost.  Entries are immutable and
+	// therefore safe to share; Params of a NamedStmt are cloned by
+	// prepareNamed before being exposed to callers.
+	namedQueryCache     sync.Map // compiledNamedQueryKey -> *compiledNamedQuery
+	namedQueryCacheSize atomic.Int64
+)
+
+// maxNamedQueryCache bounds the compiler cache so dynamically generated SQL
+// cannot grow it without limit.  Once full, new queries are simply compiled
+// without being cached.
+const maxNamedQueryCache = 4096
+
+func compileNamedQueryCached(query string, bindType int) (string, []string, error) {
+	key := compiledNamedQueryKey{query: query, bindType: bindType}
+	if v, ok := namedQueryCache.Load(key); ok {
+		c := v.(*compiledNamedQuery)
+		return c.query, c.names, nil
+	}
+
+	q, names, err := compileNamedQuery(query, bindType)
+	if err != nil {
+		return q, names, err
+	}
+	if namedQueryCacheSize.Load() < maxNamedQueryCache {
+		c := &compiledNamedQuery{query: q, names: names}
+		if _, loaded := namedQueryCache.LoadOrStore(key, c); !loaded {
+			namedQueryCacheSize.Add(1)
+		}
+	}
+	return q, names, nil
+}
+
+// bindNameRune reports whether the rune starting at s[i] can appear in a
+// named parameter, and how many bytes it occupies.  ASCII, which is what
+// practically every query uses, is checked without decoding.
+func bindNameRune(s string, i int) (ok bool, size int) {
+	b := s[i]
+	if b < utf8.RuneSelf {
+		return b == '_' || b == '.' ||
+			('a' <= b && b <= 'z') ||
+			('A' <= b && b <= 'Z') ||
+			('0' <= b && b <= '9'), 1
+	}
+	r, size := utf8.DecodeRuneInString(s[i:])
+	return unicode.IsOneOf(allowedBindRunes, r), size
+}
 
 // compile a NamedQuery into an unbound query (using the '?' bindvar) and
 // a list of names.
-func compileNamedQuery(qs []byte, bindType int) (query string, names []string, err error) {
-	names = make([]string, 0, 10)
-	rebound := make([]byte, 0, len(qs))
+//
+// Names are byte-range slices of the input instead of byte-by-byte copies, and
+// the scanner advances by rune so non-ASCII parameter names work correctly.
+func compileNamedQuery(qs string, bindType int) (query string, names []string, err error) {
+	names = make([]string, 0, 8)
+	rebound := make([]byte, 0, len(qs)+8)
 
 	inName := false
-	last := len(qs) - 1
 	currentVar := 1
-	name := make([]byte, 0, 10)
+	nameStart := 0
 
-	for i, b := range qs {
+	for i := 0; i < len(qs); {
+		b := qs[i]
+
 		// a ':' while we're in a name is an error
 		if b == ':' {
 			// if this is the second ':' in a '::' escape sequence, append a ':'
 			if inName && i > 0 && qs[i-1] == ':' {
 				rebound = append(rebound, ':')
 				inName = false
+				i++
 				continue
-			} else if inName {
-				err = errors.New("unexpected `:` while reading named param at " + strconv.Itoa(i))
-				return query, names, err
+			}
+			if inName {
+				return "", names, errors.New("unexpected `:` while reading named param at " + strconv.Itoa(i))
 			}
 			inName = true
-			name = []byte{}
-		} else if inName && i > 0 && b == '=' && len(name) == 0 {
+			nameStart = i + 1
+			i++
+			continue
+		}
+
+		// a ':=' is an assignment operator, not a parameter
+		if inName && i == nameStart && b == '=' {
 			rebound = append(rebound, ':', '=')
 			inName = false
+			i++
 			continue
-			// if we're in a name, and this is an allowed character, continue
-		} else if inName && (unicode.IsOneOf(allowedBindRunes, rune(b)) || b == '_' || b == '.') && i != last {
-			// append the byte to the name if we are in a name and not on the last byte
-			name = append(name, b)
-			// if we're in a name and it's not an allowed character, the name is done
-		} else if inName {
-			inName = false
-			// if this is the final byte of the string and it is part of the name, then
-			// make sure to add it to the name
-			if i == last && unicode.IsOneOf(allowedBindRunes, rune(b)) {
-				name = append(name, b)
+		}
+
+		if inName {
+			isName, size := bindNameRune(qs, i)
+			if isName && i+size < len(qs) {
+				// still inside the name
+				i += size
+				continue
 			}
-			// add the string representation to the names list
-			names = append(names, string(name))
+
+			end := i
+			if isName {
+				// the final rune of the query is part of the name
+				end = i + size
+			}
+			name := qs[nameStart:end]
+			names = append(names, name)
+
 			// add a proper bindvar for the bindType
 			switch bindType {
 			// oracle only supports named type bind vars even for positional
@@ -379,46 +548,48 @@ func compileNamedQuery(qs []byte, bindType int) (query string, names []string, e
 				rebound = append(rebound, '?')
 			case DOLLAR:
 				rebound = append(rebound, '$')
-				for _, b := range strconv.Itoa(currentVar) {
-					rebound = append(rebound, byte(b))
-				}
+				rebound = strconv.AppendInt(rebound, int64(currentVar), 10)
 				currentVar++
 			case AT:
 				rebound = append(rebound, '@', 'p')
-				for _, b := range strconv.Itoa(currentVar) {
-					rebound = append(rebound, byte(b))
-				}
+				rebound = strconv.AppendInt(rebound, int64(currentVar), 10)
 				currentVar++
 			}
-			// add this byte to string unless it was not part of the name
-			if i != last {
-				rebound = append(rebound, b)
-			} else if !unicode.IsOneOf(allowedBindRunes, rune(b)) {
-				rebound = append(rebound, b)
+
+			inName = false
+			// add this rune to the string unless it was part of the name
+			if end == i {
+				rebound = append(rebound, qs[i:i+size]...)
 			}
-		} else {
-			// this is a normal byte and should just go onto the rebound query
-			rebound = append(rebound, b)
+			i += size
+			continue
 		}
+
+		// this is a normal byte and should just go onto the rebound query
+		rebound = append(rebound, b)
+		i++
 	}
 
-	return string(rebound), names, err
+	return string(rebound), names, nil
 }
 
 // BindNamed binds a struct or a map to a query with named parameters.
 // DEPRECATED: use sqlx.Named` instead of this, it may be removed in future.
-func BindNamed(bindType int, query string, arg interface{}) (string, []interface{}, error) {
+func BindNamed(bindType int, query string, arg any) (string, []any, error) {
 	return bindNamedMapper(bindType, query, arg, mapper())
 }
 
 // Named takes a query using named parameters and an argument and
 // returns a new query with a list of args that can be executed by
 // a database.  The return value uses the `?` bindvar.
-func Named(query string, arg interface{}) (string, []interface{}, error) {
+func Named(query string, arg any) (string, []any, error) {
 	return bindNamedMapper(QUESTION, query, arg, mapper())
 }
 
-func bindNamedMapper(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
+func bindNamedMapper(bindType int, query string, arg any, m *reflectx.Mapper) (string, []any, error) {
+	if arg == nil {
+		return "", nil, errors.New("sqlx: nil argument passed to named query")
+	}
 	t := reflect.TypeOf(arg)
 	k := t.Kind()
 	switch {
@@ -437,8 +608,8 @@ func bindNamedMapper(bindType int, query string, arg interface{}, m *reflectx.Ma
 
 // NamedQuery binds a named query and then runs Query on the result using the
 // provided Ext (sqlx.Tx, sqlx.Db).  It works with both structs and with
-// map[string]interface{} types.
-func NamedQuery(e Ext, query string, arg interface{}) (*Rows, error) {
+// map[string]any types.
+func NamedQuery(e Ext, query string, arg any) (*Rows, error) {
 	q, args, err := bindNamedMapper(BindType(e.DriverName()), query, arg, mapperFor(e))
 	if err != nil {
 		return nil, err
@@ -449,7 +620,7 @@ func NamedQuery(e Ext, query string, arg interface{}) (*Rows, error) {
 // NamedExec uses BindStruct to get a query executable by the driver and
 // then runs Exec on the result.  Returns an error from the binding
 // or the query execution itself.
-func NamedExec(e Ext, query string, arg interface{}) (sql.Result, error) {
+func NamedExec(e Ext, query string, arg any) (sql.Result, error) {
 	q, args, err := bindNamedMapper(BindType(e.DriverName()), query, arg, mapperFor(e))
 	if err != nil {
 		return nil, err
