@@ -51,7 +51,7 @@ func pgBenchDB(b *testing.B) *DB {
 	if err != nil {
 		b.Fatal(err)
 	}
-	for i := 0; i < benchRows; i++ {
+	for i := range benchRows {
 		if _, err := stmt.Exec(int64(i), "First", "Last", fmt.Sprintf("user%d@example.com", i), float64(i)/10); err != nil {
 			b.Fatal(err)
 		}
@@ -137,6 +137,9 @@ func BenchmarkPGRowsStructScan(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -159,6 +162,9 @@ func BenchmarkPGRowsScanAs(b *testing.B) {
 				b.Fatal(err)
 			}
 			n++
+		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
 		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)
@@ -235,6 +241,9 @@ func BenchmarkPGDirectScan(b *testing.B) {
 				b.Fatal(err)
 			}
 			n++
+		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
 		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)

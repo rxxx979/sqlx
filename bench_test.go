@@ -151,6 +151,9 @@ func BenchmarkRowsStructScan(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -175,6 +178,9 @@ func BenchmarkRowsStructScanAlloc(b *testing.B) {
 			if err := rows.StructScan(&p); err != nil {
 				b.Fatal(err)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
 		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)
@@ -446,6 +452,9 @@ func BenchmarkRowsScanAs(b *testing.B) {
 			}
 			n++
 		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -590,7 +599,12 @@ func BenchmarkDirectSQLiteScan(b *testing.B) {
 			}
 			n++
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
 		if n != benchRows {
 			b.Fatalf("got %d rows", n)
 		}
@@ -641,6 +655,9 @@ func BenchmarkRowsScanAsPtr(b *testing.B) {
 				b.Fatal("nil pointer")
 			}
 			n++
+		}
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
 		}
 		if err := rows.Close(); err != nil {
 			b.Fatal(err)

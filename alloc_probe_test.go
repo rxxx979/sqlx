@@ -82,7 +82,12 @@ func BenchmarkAllocProbeDirect(b *testing.B) {
 			}
 			n++
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
 		if n != 1000 {
 			b.Fatalf("got %d", n)
 		}
@@ -134,7 +139,12 @@ func BenchmarkAllocProbeRowsStructScan(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -160,7 +170,12 @@ func BenchmarkAllocProbeDirectReuse(b *testing.B) {
 			}
 			n++
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
 		if n != 1000 {
 			b.Fatalf("got %d", n)
 		}
@@ -183,7 +198,12 @@ func benchmarkDirectCols(b *testing.B, q string, dest []any) {
 			}
 			n++
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			b.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
 		if n != benchRows {
 			b.Fatalf("got %d", n)
 		}
