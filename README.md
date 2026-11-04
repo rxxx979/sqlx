@@ -26,7 +26,7 @@ explains how to use `database/sql` along with sqlx.
 
 ## Recent Changes
 
-1.2.0 (unreleased):
+1.2.0:
 
 * New `WithTx(ctx, db, opts, fn)` helper: commits on success, rolls back on
   error, rolls back and re-panics on panic. Rollback errors are joined with the
